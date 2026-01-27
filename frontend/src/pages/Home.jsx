@@ -1,175 +1,202 @@
-import React, { useState } from "react";
+import React, { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import Modal from "../ui/Modal.jsx";
-import Toast from "../ui/Toast.jsx";
 
-export default function Home() {
+export default function Home(){
   const nav = useNavigate();
 
-  const [toast, setToast] = useState("");
+  const [tab, setTab] = useState("geral"); // geral | criar | entrar
+  const [nick, setNick] = useState("");
 
-  const [openCreate, setOpenCreate] = useState(false);
-  const [openJoin, setOpenJoin] = useState(false);
+  const [groupName, setGroupName] = useState("Grupo");
+  const [groupPass, setGroupPass] = useState("");
 
-  async function createGroup(e) {
+  const [roomId, setRoomId] = useState("");
+  const [roomPass, setRoomPass] = useState("");
+
+  const canNick = useMemo(()=>nick.trim().length >= 2, [nick]);
+
+  async function createGroup(e){
     e.preventDefault();
-    const form = new FormData(e.currentTarget);
+    try{
+      const r = await fetch("/api/groups", {
+        method: "POST",
+        headers: { "Content-Type":"application/json" },
+        body: JSON.stringify({
+          name: groupName,
+          password: groupPass,
+          nick
+        })
+      });
+      const j = await r.json();
+      if(!j.ok) return alert(j.error || "Erro ao criar grupo");
 
-    const nick = String(form.get("nick") || "");
-    const name = String(form.get("name") || "");
-    const password = String(form.get("password") || "");
-
-    const r = await fetch(`/api/groups`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, password, nick })
-    });
-
-    const j = await r.json();
-    if (!j.ok) {
-      setToast(j.error || "Erro ao criar grupo");
-      return;
+      // entra no grupo via rota; o Room vai pedir/usar query (nick/pass)
+      nav(`/g/${j.groupId}?nick=${encodeURIComponent(nick.trim())}&pass=${encodeURIComponent(groupPass)}`);
+    }catch{
+      alert("Falha ao criar grupo.");
     }
-
-    setToast("Grupo criado! Entrando...");
-    setOpenCreate(false);
-
-    // entra direto (o Room pede senha/nick se ainda não tiver)
-    nav(`/g/${j.groupId}`);
   }
 
-  async function joinGroup(e) {
+  function enterPublic(e){
     e.preventDefault();
-    const form = new FormData(e.currentTarget);
+    if(!canNick) return;
+    nav(`/geral?nick=${encodeURIComponent(nick.trim())}`);
+  }
 
-    const id = String(form.get("id") || "").trim();
-    const pass = String(form.get("password") || "");
-    const nick = String(form.get("nick") || "").trim();
-
-    if (!id.startsWith("g_")) {
-      setToast("ID inválido. Exemplo: g_xxxxxxxxxx");
-      return;
-    }
-    if (pass.length < 3) {
-      setToast("Senha muito curta.");
-      return;
-    }
-    if (nick.length < 2) {
-      setToast("Apelido inválido.");
-      return;
-    }
-
-    // temporário (não é persistência do chat, só pra preencher o modal)
-    sessionStorage.setItem("join_nick", nick);
-    sessionStorage.setItem("join_pass", pass);
-
-    setOpenJoin(false);
-    nav(`/g/${id}`);
+  function enterGroup(e){
+    e.preventDefault();
+    if(!canNick) return;
+    if(!roomId.trim()) return alert("Informe o ID do grupo.");
+    if(!roomPass) return alert("Informe a senha do grupo.");
+    nav(`/g/${encodeURIComponent(roomId.trim())}?nick=${encodeURIComponent(nick.trim())}&pass=${encodeURIComponent(roomPass)}`);
   }
 
   return (
-    <div className="shell">
-      <Toast msg={toast} onClose={() => setToast("")} />
-
-      <header className="topbar">
-        <div className="brand">
-          <div className="logo">EP</div>
+    <div className="home-wrap">
+      <div className="home-hero">
+        <div className="home-brand">
+          <div className="home-logo">EP</div>
           <div>
-            <div className="brand-title">Encode ProTech</div>
-            <div className="brand-sub">Chat Público + Grupos Privados (sem salvar nada)</div>
+            <div className="home-title">Encode ProTech</div>
+            <div className="home-sub">Chat Público + Grupos Privados (sem salvar nada)</div>
           </div>
         </div>
-      </header>
 
-      <main className="home">
-        <div className="card">
+        <div className="home-right">
+          <button className="btn" onClick={()=>nav("/area-reservada")}>Área Reservada</button>
+        </div>
+      </div>
+
+      <div className="home-container">
+        <div className="home-card">
           <h1>Entrar no chat</h1>
-          <p className="muted">
+          <p className="muted" style={{ marginTop: 6 }}>
             Tudo é temporário: mensagens ficam apenas em RAM enquanto há usuários conectados.
           </p>
 
-          <div className="actions">
-            <button className="btn primary" onClick={() => nav("/geral")}>
+          <div className="home-tabs">
+            <button
+              className={"home-tab " + (tab==="geral" ? "active" : "")}
+              onClick={()=>setTab("geral")}
+              type="button"
+            >
               Geral
             </button>
-
-            <button className="btn" onClick={() => setOpenCreate(true)}>
+            <button
+              className={"home-tab " + (tab==="criar" ? "active" : "")}
+              onClick={()=>setTab("criar")}
+              type="button"
+            >
               Criar grupo
             </button>
-
-            <button className="btn" onClick={() => setOpenJoin(true)}>
+            <button
+              className={"home-tab " + (tab==="entrar" ? "active" : "")}
+              onClick={()=>setTab("entrar")}
+              type="button"
+            >
               Entrar em grupo
             </button>
           </div>
 
-          <div className="note">
-            Você entra informando <span className="pill">ID</span> + <span className="pill">senha</span> +{" "}
-            <span className="pill">apelido</span>.
+          <div className="home-panel">
+            <label className="home-label">
+              Apelido
+              <input
+                className="home-input"
+                value={nick}
+                onChange={(e)=>setNick(e.target.value)}
+                placeholder="Ex.: Lucas"
+                minLength={2}
+                maxLength={18}
+                required
+              />
+            </label>
+
+            {tab === "geral" && (
+              <form onSubmit={enterPublic} className="home-form">
+                <div className="home-tip">
+                  Você entra com <span className="pill mono">apelido</span> e começa a conversar no <b>Geral</b>.
+                </div>
+                <button className="btn primary" disabled={!canNick} type="submit">
+                  Entrar no Geral
+                </button>
+              </form>
+            )}
+
+            {tab === "criar" && (
+              <form onSubmit={createGroup} className="home-form">
+                <label className="home-label">
+                  Nome do grupo
+                  <input
+                    className="home-input"
+                    value={groupName}
+                    onChange={(e)=>setGroupName(e.target.value)}
+                    placeholder="Ex.: Amigos"
+                    maxLength={32}
+                    required
+                  />
+                </label>
+
+                <label className="home-label">
+                  Senha do grupo
+                  <input
+                    className="home-input"
+                    type="password"
+                    value={groupPass}
+                    onChange={(e)=>setGroupPass(e.target.value)}
+                    placeholder="Mínimo 3 caracteres"
+                    minLength={3}
+                    required
+                  />
+                </label>
+
+                <div className="home-tip">
+                  Um ID será gerado para o grupo. Ele existe enquanto houver gente conectada.
+                </div>
+
+                <button className="btn primary" disabled={!canNick || groupPass.length < 3} type="submit">
+                  Criar e entrar
+                </button>
+              </form>
+            )}
+
+            {tab === "entrar" && (
+              <form onSubmit={enterGroup} className="home-form">
+                <label className="home-label">
+                  ID do grupo
+                  <input
+                    className="home-input mono"
+                    value={roomId}
+                    onChange={(e)=>setRoomId(e.target.value)}
+                    placeholder="Ex.: g_a1b2c3d4e5"
+                    required
+                  />
+                </label>
+
+                <label className="home-label">
+                  Senha do grupo
+                  <input
+                    className="home-input"
+                    type="password"
+                    value={roomPass}
+                    onChange={(e)=>setRoomPass(e.target.value)}
+                    placeholder="Digite a senha"
+                    required
+                  />
+                </label>
+
+                <button className="btn primary" disabled={!canNick || !roomId.trim() || !roomPass} type="submit">
+                  Entrar no grupo
+                </button>
+              </form>
+            )}
+          </div>
+
+          <div className="home-foot muted">
+            Encode ProTech • Sem persistência • Pronto para Render
           </div>
         </div>
-      </main>
-
-      {/* MODAL - CRIAR */}
-      <Modal open={openCreate} title="Criar grupo privado">
-        <form onSubmit={createGroup} className="form">
-          <label>
-            Seu apelido
-            <input name="nick" placeholder="Ex: Lucas" required minLength={2} maxLength={18} />
-          </label>
-
-          <label>
-            Nome do grupo
-            <input name="name" placeholder="Ex: Encode Squad" maxLength={32} />
-          </label>
-
-          <label>
-            Senha do grupo
-            <input name="password" type="password" placeholder="Crie uma senha" required minLength={3} />
-          </label>
-
-          <div className="row">
-            <button type="button" className="btn" onClick={() => setOpenCreate(false)}>
-              Cancelar
-            </button>
-            <button className="btn primary" type="submit">
-              Criar
-            </button>
-          </div>
-        </form>
-      </Modal>
-
-      {/* MODAL - ENTRAR */}
-      <Modal open={openJoin} title="Entrar em um grupo">
-        <form onSubmit={joinGroup} className="form">
-          <label>
-            ID do grupo
-            <input name="id" placeholder="Ex: g_xxxxxxxxxx" required minLength={3} />
-          </label>
-
-          <label>
-            Senha do grupo
-            <input name="password" type="password" placeholder="Senha" required minLength={3} />
-          </label>
-
-          <label>
-            Seu apelido
-            <input name="nick" placeholder="Ex: Maria" required minLength={2} maxLength={18} />
-          </label>
-
-          <div className="row">
-            <button type="button" className="btn" onClick={() => setOpenJoin(false)}>
-              Cancelar
-            </button>
-            <button className="btn primary" type="submit">
-              Entrar
-            </button>
-          </div>
-        </form>
-      </Modal>
-
-      <footer className="footer">
-        <span className="muted">Encode ProTech · Sem persistência · Pronto para Render</span>
-      </footer>
+      </div>
     </div>
   );
 }

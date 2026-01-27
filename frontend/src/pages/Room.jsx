@@ -1,665 +1,690 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
-import { socket } from "../lib/socket.js";
-import Modal from "../ui/Modal.jsx";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { io } from "socket.io-client";
 import Toast from "../ui/Toast.jsx";
+import Modal from "../ui/Modal.jsx";
 
-function nowTime(ts){
-  const d = new Date(ts);
-  return d.toLocaleTimeString("pt-BR", { hour:"2-digit", minute:"2-digit" });
+function useQuery(){
+  const { search } = useLocation();
+  return useMemo(() => new URLSearchParams(search), [search]);
 }
 
-const QUICK_REACTIONS = ["👍","😂","❤️","🔥","😮","👏","😡","🎉"];
+function fmtHhmm(ts){
+  try{
+    return new Date(ts).toLocaleTimeString("pt-BR", { hour:"2-digit", minute:"2-digit" });
+  }catch{
+    return "";
+  }
+}
 
-export default function Room({ mode }){
+function safeNick(n){
+  const s = String(n || "").trim().replace(/\s+/g, " ");
+  if(s.length < 2) return "";
+  return s.slice(0, 18);
+}
+
+function shortText(s, max=90){
+  const t = String(s || "");
+  if(t.length <= max) return t;
+  return t.slice(0, max-1) + "…";
+}
+
+const QUICK_REACTIONS = ["👍","❤️","😂","😮","😡","👏","🔥","✅"];
+
+export default function Room(){
   const nav = useNavigate();
   const params = useParams();
-  const roomId = mode === "group" ? params.id : "geral";
+  const q = useQuery();
+  const location = useLocation();
+
+  // rota: /geral  ou /g/:id
+  const isGeneral = location.pathname.includes("/geral");
+  const roomId = isGeneral ? "geral" : (params.id || "");
+
+  // query
+  const nickFromUrl = safeNick(q.get("nick"));
+  const passFromUrl = q.get("pass") || "";
 
   const [toast, setToast] = useState("");
-  const [openAuth, setOpenAuth] = useState(true);
-
-  // pega do sessionStorage (usado na Home "Entrar em grupo")
-  const [nick, setNick] = useState(() => sessionStorage.getItem("join_nick") || "");
-  const [password, setPassword] = useState(() => sessionStorage.getItem("join_pass") || "");
-
+  const [banner, setBanner] = useState(""); // aviso persistente do admin
   const [room, setRoom] = useState(null);
+  const [frozen, setFrozen] = useState(false);
+
+  const [users, setUsers] = useState([]); // [{socketId,nick}]
   const [msgs, setMsgs] = useState([]);
 
   const [text, setText] = useState("");
+  const [replyTo, setReplyTo] = useState(null); // {id,userNick,preview}
+  const [showReactionsFor, setShowReactionsFor] = useState(null); // msgId
+  const [sending, setSending] = useState(false);
+
+  const [openDm, setOpenDm] = useState(false);
+  const [dmTarget, setDmTarget] = useState(null); // {socketId,nick}
+  const [dmText, setDmText] = useState("");
+
+  const [isRecording, setIsRecording] = useState(false);
+  const recRef = useRef(null);
+  const recChunksRef = useRef([]);
+  const fileInputRef = useRef(null);
+
+  const socketRef = useRef(null);
   const listRef = useRef(null);
 
-  // ONLINE + REPLY + PICKER
-  const [usersOnline, setUsersOnline] = useState([]); // [{socketId,nick}]
-  const [reply, setReply] = useState(null); // {id,nick,preview,type}
-  const [picker, setPicker] = useState(null); // { messageId, x, y, dm: false }
+  const myNick = nickFromUrl;
 
-  // DM
-  const [dmOpen, setDmOpen] = useState(false);
-  const [dmPeer, setDmPeer] = useState(null); // {socketId,nick}
-  const [dmId, setDmId] = useState("");
-  const [dmMsgs, setDmMsgs] = useState([]);
-  const [dmText, setDmText] = useState("");
-  const dmListRef = useRef(null);
+  const canEnter = useMemo(()=>{
+    if(!myNick) return false;
+    if(isGeneral) return true;
+    return !!roomId && !!passFromUrl; // grupo precisa pass
+  }, [myNick, isGeneral, roomId, passFromUrl]);
 
-  const inviteLink = useMemo(()=>{
-    if(mode !== "group") return "";
-    return `${location.origin}/#/g/${roomId}`;
-  }, [mode, roomId]);
-
-  function scrollToBottom(){
+  // scroll to bottom
+  function scrollBottom(){
     const el = listRef.current;
     if(!el) return;
     el.scrollTop = el.scrollHeight;
   }
 
-  function scrollDmBottom(){
-    const el = dmListRef.current;
-    if(!el) return;
-    el.scrollTop = el.scrollHeight;
-  }
-
-  function safeExit(reason){
-    // Fecha tudo, mostra aviso e sai pro início
-    try{
-      socket.disconnect();
-    }catch{}
-    setDmOpen(false);
-    setReply(null);
-    setPicker(null);
-    setOpenAuth(true);
-    if(reason) setToast(reason);
-    setTimeout(()=>nav("/"), 350);
-  }
-
+  // fallback (se abrir rota sem parâmetros)
   useEffect(()=>{
-    function onSnap(snap){
-      setRoom(snap.room);
-      setMsgs(snap.messages || []);
-
-      // entrou ok: limpa credenciais temporárias
-      sessionStorage.removeItem("join_nick");
-      sessionStorage.removeItem("join_pass");
-
-      setTimeout(()=>scrollToBottom(), 30);
+    if(!myNick){
+      setToast("Informe um apelido para entrar.");
+      nav("/", { replace:true });
+      return;
     }
-
-    function onNew(m){
-      setMsgs(prev => [...prev, m]);
-      setTimeout(()=>scrollToBottom(), 30);
-    }
-
-    function onPresence(p){
-      if(p?.nick) setToast(p.type === "join" ? `${p.nick} entrou` : `${p.nick} saiu`);
-    }
-
-    function onDeleted({ ids }){
-      if(!ids?.length) return;
-      setMsgs(prev => prev.filter(m => !ids.includes(m.id)));
-    }
-
-    function onReact({ messageId, reactions }){
-      setMsgs(prev => prev.map(m => m.id === messageId ? { ...m, reactions } : m));
-    }
-
-    function onErr({ message }){
-      setToast(message || "Erro");
-    }
-
-    function onUsersList(payload){
-      if(payload?.roomId !== roomId) return;
-      setUsersOnline(payload.users || []);
-    }
-
-    // ✅ Aviso do admin (toast na tela)
-    function onAdminNotice(payload){
-      const msg = String(payload?.message || "").trim();
-      if(msg) setToast(`⚠️ Aviso: ${msg}`);
-    }
-
-    // ✅ Kick / Ban (sai do chat)
-    function onAdminKick(payload){
-      const msg = String(payload?.message || "Você foi removido pelo administrador.").trim();
-      safeExit(msg);
-    }
-    function onAdminBan(payload){
-      const msg = String(payload?.message || "Seu acesso foi bloqueado.").trim();
-      safeExit(msg);
-    }
-
-    // DM handlers
-    function onDmReady({ dmId, peer }){
-      setDmId(dmId);
-      setDmPeer(peer);
-      setDmOpen(true);
-      setTimeout(()=>scrollDmBottom(), 30);
-    }
-
-    function onDmSnap({ dmId: id, messages }){
-      if(!id) return;
-      setDmMsgs(messages || []);
-      setTimeout(()=>scrollDmBottom(), 30);
-    }
-
-    function onDmNew({ dmId: id, message }){
-      if(!id || !message) return;
-      setDmMsgs(prev => [...prev, message]);
-      setTimeout(()=>scrollDmBottom(), 30);
-    }
-
-    function onDmReacted({ dmId: id, messageId, reactions }){
-      if(!id) return;
-      setDmMsgs(prev => prev.map(m => m.id === messageId ? { ...m, reactions } : m));
-    }
-
-    socket.on("room_snapshot", onSnap);
-    socket.on("new_message", onNew);
-    socket.on("presence", onPresence);
-    socket.on("message_deleted", onDeleted);
-    socket.on("message_reacted", onReact);
-    socket.on("error_toast", onErr);
-
-    socket.on("users_list", onUsersList);
-
-    // ✅ Admin
-    socket.on("admin_notice", onAdminNotice);
-    socket.on("admin_kick", onAdminKick);
-    socket.on("admin_ban", onAdminBan);
-
-    socket.on("dm_ready", onDmReady);
-    socket.on("dm_snapshot", onDmSnap);
-    socket.on("dm_new_message", onDmNew);
-    socket.on("dm_reacted", onDmReacted);
-
-    return ()=>{
-      socket.off("room_snapshot", onSnap);
-      socket.off("new_message", onNew);
-      socket.off("presence", onPresence);
-      socket.off("message_deleted", onDeleted);
-      socket.off("message_reacted", onReact);
-      socket.off("error_toast", onErr);
-
-      socket.off("users_list", onUsersList);
-
-      socket.off("admin_notice", onAdminNotice);
-      socket.off("admin_kick", onAdminKick);
-      socket.off("admin_ban", onAdminBan);
-
-      socket.off("dm_ready", onDmReady);
-      socket.off("dm_snapshot", onDmSnap);
-      socket.off("dm_new_message", onDmNew);
-      socket.off("dm_reacted", onDmReacted);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId]);
-
-  // Se entrar em grupo e senha estiver errada, reabre o modal se não veio snapshot.
-  useEffect(()=>{
-    if(openAuth) return;
-    const t = setTimeout(()=>{
-      if(mode === "group" && !room){
-        setOpenAuth(true);
+    if(!isGeneral){
+      if(!roomId){
+        setToast("Grupo inválido.");
+        nav("/", { replace:true });
+        return;
       }
-    }, 1200);
-    return ()=>clearTimeout(t);
-  }, [openAuth, room, mode]);
-
-  function setReplyFromMessage(m){
-    setReply({
-      id: m.id,
-      nick: m.nick,
-      type: m.type,
-      preview: m.type === "text" ? m.content : (m.type === "image" ? "[imagem]" : "[áudio]")
-    });
-  }
-
-  function openPickerForMessage(ev, m, isDm=false){
-    setPicker({
-      messageId: m.id,
-      x: ev.clientX,
-      y: ev.clientY,
-      dm: isDm
-    });
-  }
-
-  function closePicker(){
-    setPicker(null);
-  }
-
-  function reactPick(emoji){
-    if(!picker) return;
-    if(picker.dm){
-      if(!dmId) return closePicker();
-      socket.emit("react_dm", { dmId, messageId: picker.messageId, emoji });
-    }else{
-      socket.emit("react_message", { roomId, messageId: picker.messageId, emoji });
+      if(!passFromUrl){
+        setToast("Informe a senha do grupo.");
+        nav("/", { replace:true });
+        return;
+      }
     }
-    closePicker();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // conexão socket
+  useEffect(()=>{
+    if(!canEnter) return;
+
+    const s = io("/", {
+      transports: ["websocket", "polling"],
+      reconnection: true,
+      reconnectionAttempts: 8,
+      reconnectionDelay: 700,
+      timeout: 15000,
+    });
+
+    socketRef.current = s;
+
+    s.on("connect", () => {
+      setToast("");
+      if(isGeneral){
+        s.emit("join_public", { nick: myNick });
+      }else{
+        s.emit("join_group", { roomId, nick: myNick, password: passFromUrl });
+      }
+    });
+
+    s.on("disconnect", () => {
+      // só sinaliza, não expulsa
+    });
+
+    // snapshot inicial
+    s.on("room_snapshot", (payload) => {
+      setRoom(payload?.room || null);
+      setMsgs(Array.isArray(payload?.messages) ? payload.messages : []);
+      setTimeout(scrollBottom, 60);
+    });
+
+    s.on("room_frozen", ({ frozen }) => {
+      setFrozen(!!frozen);
+      if(frozen){
+        setToast("Sala congelada pelo administrador.");
+      }
+    });
+
+    // lista de usuários
+    s.on("users_list", (p) => {
+      const arr = Array.isArray(p?.users) ? p.users : [];
+      setUsers(arr);
+    });
+
+    // presença
+    s.on("presence", (p) => {
+      if(!p?.nick) return;
+      if(p.type === "join") setToast(`${p.nick} entrou.`);
+      if(p.type === "leave") setToast(`${p.nick} saiu.`);
+    });
+
+    // novas mensagens
+    s.on("message_new", ({ message }) => {
+      if(!message) return;
+      setMsgs(prev => [...prev, message]);
+      setTimeout(scrollBottom, 30);
+    });
+
+    // deletadas (ex: ao sair / moderação)
+    s.on("message_deleted", ({ ids }) => {
+      const setIds = new Set(ids || []);
+      if(setIds.size === 0) return;
+      setMsgs(prev => prev.filter(m => !setIds.has(m.id)));
+    });
+
+    // reação (se backend emitir)
+    s.on("message_reaction", ({ id, reactions }) => {
+      if(!id) return;
+      setMsgs(prev => prev.map(m => (m.id === id ? { ...m, reactions } : m)));
+    });
+
+    // avisos do admin
+    s.on("admin_notice", ({ message }) => {
+      const msg = String(message || "").trim();
+      if(!msg) return;
+      setBanner(msg);
+      setToast("Aviso do administrador recebido.");
+    });
+
+    s.on("admin_kick", ({ message }) => {
+      setToast(message || "Você foi removido pelo administrador.");
+      setTimeout(()=>nav("/", { replace:true }), 800);
+    });
+
+    s.on("admin_ban", ({ message }) => {
+      setToast(message || "Acesso bloqueado pelo administrador.");
+      setTimeout(()=>nav("/", { replace:true }), 900);
+    });
+
+    s.on("error_toast", ({ message }) => {
+      if(message) setToast(message);
+    });
+
+    return () => {
+      try{ s.disconnect(); }catch{}
+      socketRef.current = null;
+    };
+  }, [canEnter, isGeneral, myNick, nav, passFromUrl, roomId]);
+
+  // envia texto
+  async function sendText(e){
+    e?.preventDefault?.();
+    if(sending) return;
+    const s = socketRef.current;
+    if(!s) return;
+
+    const content = String(text || "").trim();
+    if(!content) return;
+
+    setSending(true);
+    try{
+      s.emit("send_message", {
+        type: "text",
+        content,
+        roomId: room?.id || roomId,
+        replyTo: replyTo ? { id: replyTo.id, userNick: replyTo.userNick, preview: replyTo.preview } : null
+      });
+      setText("");
+      setReplyTo(null);
+      setShowReactionsFor(null);
+    } finally {
+      setSending(false);
+    }
   }
 
-  async function enter(e){
-    e.preventDefault();
-    const n = nick.trim();
-    if(n.length < 2){ setToast("Apelido inválido"); return; }
+  // upload imagem
+  async function onPickImage(ev){
+    const file = ev.target.files?.[0];
+    ev.target.value = "";
+    if(!file) return;
 
-    if(mode === "public"){
-      socket.emit("join_public", { nick: n });
-      setOpenAuth(false);
+    if(file.size > 4.5 * 1024 * 1024){
+      setToast("Imagem muito grande (máx ~4.5MB).");
       return;
     }
 
-    socket.emit("join_group", { roomId, nick: n, password });
-    setOpenAuth(false);
+    const s = socketRef.current;
+    if(!s) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64 = String(reader.result || "");
+      s.emit("send_message", {
+        type: "image",
+        content: base64,
+        roomId: room?.id || roomId,
+        replyTo: replyTo ? { id: replyTo.id, userNick: replyTo.userNick, preview: replyTo.preview } : null
+      });
+      setReplyTo(null);
+      setShowReactionsFor(null);
+    };
+    reader.readAsDataURL(file);
   }
 
-  function sendText(){
-    const t = text.trim();
-    if(!t) return;
-    socket.emit("send_message", {
-      roomId,
-      type:"text",
-      content: t,
-      replyTo: reply
-    });
-    setText("");
-    setReply(null);
-  }
+  // grava áudio
+  async function toggleRecord(){
+    const s = socketRef.current;
+    if(!s) return;
 
-  async function sendImage(file){
-    if(!file) return;
-    if(file.size > 2_000_000){ setToast("Imagem muito grande (máx 2MB)"); return; }
-    const dataUrl = await toDataUrl(file);
-    socket.emit("send_message", { roomId, type:"image", content: dataUrl, replyTo: reply });
-    setReply(null);
-  }
+    if(isRecording){
+      try{
+        recRef.current?.stop?.();
+      }catch{}
+      return;
+    }
 
-  async function recordAudio(){
+    if(!navigator.mediaDevices?.getUserMedia){
+      setToast("Seu navegador não suporta gravação de áudio.");
+      return;
+    }
+
     try{
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const rec = new MediaRecorder(stream);
-      const chunks = [];
-      rec.ondataavailable = (e)=>chunks.push(e.data);
-      rec.onstop = async ()=>{
-        stream.getTracks().forEach(t=>t.stop());
-        const blob = new Blob(chunks, { type: "audio/webm" });
-        if(blob.size > 2_500_000){ setToast("Áudio muito grande (máx ~2.5MB)"); return; }
-        const dataUrl = await blobToDataUrl(blob);
-        socket.emit("send_message", { roomId, type:"audio", content: dataUrl, replyTo: reply });
-        setReply(null);
+      recRef.current = rec;
+      recChunksRef.current = [];
+
+      rec.ondataavailable = (e) => {
+        if(e.data?.size) recChunksRef.current.push(e.data);
       };
+
+      rec.onstop = async () => {
+        setIsRecording(false);
+        stream.getTracks().forEach(t => t.stop());
+
+        const blob = new Blob(recChunksRef.current, { type: "audio/webm" });
+        recChunksRef.current = [];
+
+        if(blob.size > 4.5 * 1024 * 1024){
+          setToast("Áudio muito grande (máx ~4.5MB).");
+          return;
+        }
+
+        // converte para base64
+        const fr = new FileReader();
+        fr.onload = () => {
+          const base64 = String(fr.result || "");
+          s.emit("send_message", {
+            type: "audio",
+            content: base64,
+            roomId: room?.id || roomId,
+            replyTo: replyTo ? { id: replyTo.id, userNick: replyTo.userNick, preview: replyTo.preview } : null
+          });
+          setReplyTo(null);
+          setShowReactionsFor(null);
+        };
+        fr.readAsDataURL(blob);
+      };
+
       rec.start();
-      setToast("Gravando... clique novamente para parar");
-      setTimeout(()=>{ if(rec.state !== "inactive") rec.stop(); }, 10_000);
-      recordAudio._rec = rec;
+      setIsRecording(true);
+      setToast("Gravando… clique novamente para enviar.");
     }catch{
-      setToast("Sem permissão de microfone");
+      setToast("Permissão de microfone negada.");
     }
   }
 
-  function toggleAudio(){
-    const r = recordAudio._rec;
-    if(r && r.state !== "inactive"){
-      r.stop();
-      recordAudio._rec = null;
-      setToast("Enviando áudio...");
-      return;
-    }
-    recordAudio();
+  // reply
+  function setReply(m){
+    setReplyTo({
+      id: m.id,
+      userNick: m.nick || "—",
+      preview: m.type === "text" ? shortText(m.content, 120) : (m.type === "image" ? "📷 Imagem" : "🎤 Áudio")
+    });
+    setTimeout(()=>document.getElementById("msgInput")?.focus?.(), 30);
   }
 
-  async function copyInvite(){
+  // reactions
+  function openReactions(m){
+    setShowReactionsFor(prev => (prev === m.id ? null : m.id));
+  }
+  function react(m, emoji){
+    const s = socketRef.current;
+    if(!s) return;
+    setShowReactionsFor(null);
+
+    // tenta emitir; se backend não tiver, não quebra
     try{
-      await navigator.clipboard.writeText(inviteLink);
-      setToast("Link copiado!");
+      s.emit("react_message", { roomId: room?.id || roomId, messageId: m.id, emoji });
+    }catch{}
+  }
+
+  // dm modal
+  function openDmTo(u){
+    setDmTarget(u);
+    setDmText("");
+    setOpenDm(true);
+  }
+  function sendDm(e){
+    e?.preventDefault?.();
+    const s = socketRef.current;
+    if(!s) return;
+
+    const msg = String(dmText || "").trim();
+    if(!msg) return;
+
+    // tenta enviar dm; se backend não suportar, avisa
+    try{
+      s.emit("send_dm", { to: dmTarget?.socketId, content: msg });
+      setToast(`Mensagem privada enviada para ${dmTarget?.nick}.`);
+      setOpenDm(false);
     }catch{
-      setToast("Não consegui copiar. Copie manualmente.");
+      setToast("DM ainda não está habilitado no servidor.");
     }
   }
 
-  function openDmWith(peerSocketId){
-    if(!peerSocketId) return;
-    socket.emit("start_dm", { peerSocketId });
-  }
-
-  function sendDmText(){
-    const t = dmText.trim();
-    if(!t || !dmId) return;
-    socket.emit("send_dm", { dmId, type:"text", content: t, replyTo: null });
-    setDmText("");
-  }
+  // resolve nick do autor e reactions (se existir)
+  const title = room?.name || (isGeneral ? "Geral" : "Grupo");
+  const subtitle = isGeneral ? "Sala pública" : `Grupo: ${roomId}`;
 
   return (
     <div className="shell">
       <Toast msg={toast} onClose={()=>setToast("")} />
 
+      {/* Topbar do chat */}
       <header className="topbar">
         <div className="brand clickable" onClick={()=>nav("/")}>
           <div className="logo">EP</div>
           <div>
-            <div className="brand-title">{room?.name || (mode==="public" ? "Geral" : "Grupo privado")}</div>
-            <div className="brand-sub">
-              {mode==="public" ? "Sala pública temporária" : `ID: ${roomId}`}
-            </div>
+            <div className="brand-title">{title}</div>
+            <div className="brand-sub">{subtitle} • Online: {users.length}</div>
           </div>
         </div>
 
         <div className="top-actions">
-          {mode==="group" && (
-            <button className="btn" onClick={copyInvite}>Copiar link</button>
-          )}
-          <button className="btn danger" onClick={()=>nav("/")}>Sair</button>
+          <button className="btn" onClick={()=>nav("/")} title="Voltar">Voltar</button>
+          <button className="btn" onClick={()=>nav("/area-reservada")} title="Admin">Área Reservada</button>
         </div>
       </header>
 
-      <main className="chat">
-        <div className="chat-left">
-          <div className="room-card">
-            <div className="room-label">Status</div>
-            <div className="muted">
-              Nada é salvo. Ao fechar o chat, suas mensagens somem.
+      <main style={{ width: "min(1100px, 100%)", margin: "0 auto", padding: "14px 14px 26px" }}>
+        {/* aviso do admin */}
+        {banner && (
+          <div className="admin-card" style={{ marginBottom: 14 }}>
+            <h2>Aviso do administrador</h2>
+            <div className="muted" style={{ fontSize: 14, lineHeight: 1.5 }}>{banner}</div>
+            <div style={{ marginTop: 12, display:"flex", justifyContent:"flex-end" }}>
+              <button className="btn" onClick={()=>setBanner("")}>Fechar aviso</button>
+            </div>
+          </div>
+        )}
+
+        {/* status sala */}
+        {(frozen) && (
+          <div className="admin-card" style={{ marginBottom: 14 }}>
+            <h2>⚠️ Sala congelada</h2>
+            <div className="muted">O administrador congelou esta sala. Envio de mensagens está bloqueado.</div>
+          </div>
+        )}
+
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 320px", gap: 14 }}>
+          {/* mensagens */}
+          <div className="admin-card full" style={{ gridColumn:"auto", padding: 0 }}>
+            <div style={{
+              padding: "12px 14px",
+              borderBottom: "1px solid rgba(255,255,255,.10)",
+              background: "rgba(0,0,0,.18)",
+              display:"flex",
+              alignItems:"center",
+              justifyContent:"space-between",
+              gap: 10
+            }}>
+              <div style={{ fontWeight: 1000 }}>Mensagens</div>
+              <div className="muted" style={{ fontSize: 12 }}>
+                Dica: duplo clique na mensagem para reagir • clique em “Responder”
+              </div>
             </div>
 
-            {mode==="group" && (
-              <div className="invite">
-                <div className="room-label">Convite</div>
-                <div className="pill mono">{inviteLink}</div>
-              </div>
-            )}
+            <div
+              ref={listRef}
+              style={{
+                padding: 14,
+                height: "min(62vh, 620px)",
+                overflow: "auto"
+              }}
+            >
+              {msgs.length === 0 && (
+                <div className="muted">Ainda não há mensagens nesta sala.</div>
+              )}
 
-            <div style={{ marginTop: 10 }} className="muted">
-              Dica: <b>clique</b> numa mensagem para responder. <b>duplo clique</b> para reagir.
+              {msgs.map((m) => (
+                <div
+                  key={m.id}
+                  className="control"
+                  style={{ marginBottom: 10, alignItems:"stretch", cursor:"default" }}
+                  onDoubleClick={()=>openReactions(m)}
+                  onMouseDown={()=>{ /* fecha barra ao clicar fora */
+                    if(showReactionsFor && showReactionsFor !== m.id) setShowReactionsFor(null);
+                  }}
+                >
+                  <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap: 10 }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ display:"flex", alignItems:"center", gap: 8, flexWrap:"wrap" }}>
+                        <span style={{ fontWeight: 1000 }}>{m.nick || "—"}</span>
+                        <span className="badge mono" style={{ fontSize: 11, padding:"4px 8px" }}>{fmtHhmm(m.ts || Date.now())}</span>
+                        {m.userId === socketRef.current?.id && (
+                          <span className="badge" style={{ fontSize: 11, padding:"4px 8px" }}>Você</span>
+                        )}
+                      </div>
+
+                      {/* reply preview */}
+                      {m.replyTo?.id && (
+                        <div style={{
+                          marginTop: 8,
+                          padding: "10px 10px",
+                          borderRadius: 14,
+                          border: "1px solid rgba(255,255,255,.08)",
+                          background: "rgba(0,0,0,.18)"
+                        }}>
+                          <div className="muted" style={{ fontSize: 12 }}>
+                            Respondendo a <b style={{ color:"var(--text)" }}>{m.replyTo.userNick || "—"}</b>
+                          </div>
+                          <div style={{ marginTop: 4, fontSize: 13 }}>
+                            {shortText(m.replyTo.preview || "", 120)}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* content */}
+                      <div style={{ marginTop: 10, fontSize: 14, lineHeight: 1.45, wordBreak:"break-word" }}>
+                        {m.type === "text" && <span>{m.content}</span>}
+                        {m.type === "image" && (
+                          <img
+                            src={m.content}
+                            alt="imagem"
+                            style={{
+                              maxWidth: "100%",
+                              borderRadius: 14,
+                              border: "1px solid rgba(255,255,255,.10)",
+                              display:"block"
+                            }}
+                          />
+                        )}
+                        {m.type === "audio" && (
+                          <audio controls src={m.content} style={{ width: "100%" }} />
+                        )}
+                      </div>
+
+                      {/* reactions display */}
+                      {m.reactions && typeof m.reactions === "object" && (
+                        <div style={{ marginTop: 10, display:"flex", gap: 8, flexWrap:"wrap" }}>
+                          {Object.entries(m.reactions).map(([emo, count]) => (
+                            <span key={emo} className="badge" style={{ padding:"6px 10px" }}>
+                              {emo} <b>{count}</b>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* quick reactions bar */}
+                      {showReactionsFor === m.id && (
+                        <div style={{ marginTop: 10, display:"flex", gap: 8, flexWrap:"wrap" }}>
+                          {QUICK_REACTIONS.map((emo) => (
+                            <button
+                              key={emo}
+                              type="button"
+                              className="btn"
+                              style={{ padding:"8px 10px", borderRadius: 999, fontWeight: 1000 }}
+                              onClick={()=>react(m, emo)}
+                              title={`Reagir com ${emo}`}
+                            >
+                              {emo}
+                            </button>
+                          ))}
+                          <button
+                            type="button"
+                            className="btn"
+                            style={{ padding:"8px 10px", borderRadius: 999 }}
+                            onClick={()=>setShowReactionsFor(null)}
+                          >
+                            Fechar
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* actions */}
+                    <div style={{ display:"flex", flexDirection:"column", gap: 8, alignItems:"flex-end" }}>
+                      <button className="btn" type="button" onClick={()=>setReply(m)}>Responder</button>
+                      {m.userId && m.userId !== socketRef.current?.id && (
+                        <button
+                          className="btn"
+                          type="button"
+                          onClick={()=>openDmTo({ socketId: m.userId, nick: m.nick || "Usuário" })}
+                          title="Mensagem privada"
+                        >
+                          Privado
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* composer */}
+            <div style={{
+              padding: 14,
+              borderTop: "1px solid rgba(255,255,255,.10)",
+              background: "rgba(0,0,0,.16)"
+            }}>
+              {replyTo && (
+                <div style={{
+                  marginBottom: 10,
+                  padding: "10px 10px",
+                  borderRadius: 16,
+                  border: "1px solid rgba(255,255,255,.10)",
+                  background: "rgba(0,0,0,.18)",
+                  display:"flex",
+                  justifyContent:"space-between",
+                  gap: 10,
+                  alignItems:"center"
+                }}>
+                  <div style={{ minWidth:0 }}>
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      Respondendo a <b style={{ color:"var(--text)" }}>{replyTo.userNick}</b>
+                    </div>
+                    <div style={{ fontSize: 13, marginTop: 4 }}>
+                      {shortText(replyTo.preview, 140)}
+                    </div>
+                  </div>
+                  <button className="btn" type="button" onClick={()=>setReplyTo(null)}>Cancelar</button>
+                </div>
+              )}
+
+              <form onSubmit={sendText} style={{ display:"flex", gap: 10, alignItems:"center" }}>
+                <input
+                  id="msgInput"
+                  className="home-input"
+                  style={{ flex: 1 }}
+                  value={text}
+                  onChange={(e)=>setText(e.target.value)}
+                  placeholder={frozen ? "Sala congelada pelo administrador." : "Digite sua mensagem…"}
+                  disabled={frozen}
+                  maxLength={1200}
+                />
+                <button className="btn" type="button" disabled={frozen} onClick={()=>fileInputRef.current?.click?.()}>
+                  Foto
+                </button>
+                <button className={"btn " + (isRecording ? "danger" : "")} type="button" disabled={frozen} onClick={toggleRecord}>
+                  {isRecording ? "Parar" : "Áudio"}
+                </button>
+                <button className="btn primary" type="submit" disabled={frozen || !text.trim() || sending}>
+                  Enviar
+                </button>
+
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  style={{ display:"none" }}
+                  onChange={onPickImage}
+                />
+              </form>
+
+              <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
+                Sem histórico: ao ficar vazio, o servidor limpa as mensagens.
+              </div>
             </div>
           </div>
 
-          <div className="room-card" style={{ marginTop: 12 }}>
-            <div className="room-label">Online</div>
+          {/* sidebar users */}
+          <div className="admin-card" style={{ gridColumn:"auto" }}>
+            <h2>Usuários online</h2>
+            <div className="muted" style={{ fontSize: 13, marginBottom: 10 }}>
+              Clique em um usuário para abrir “Privado”.
+            </div>
 
-            {usersOnline.length === 0 && <div className="muted">Ninguém online.</div>}
-
-            <div style={{ display:"grid", gap:8 }}>
-              {usersOnline.map(u=>{
-                const me = u.nick === nick.trim();
-                return (
-                  <div
-                    key={u.socketId}
-                    style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:8 }}
-                  >
-                    <div style={{ fontWeight:800 }}>
-                      {u.nick}{me ? " (você)" : ""}
-                    </div>
-                    <button
-                      className="btn"
-                      onClick={()=>openDmWith(u.socketId)}
-                      disabled={me}
-                      title="Mensagem privada"
-                    >
-                      DM
+            <div className="users-list">
+              {users.length === 0 && <div className="muted">Ninguém online agora.</div>}
+              {users.map((u) => (
+                <div key={u.socketId} className="user-row">
+                  <div className="user-nick">{u.nick}</div>
+                  <div className="user-actions">
+                    <button className="btn" type="button" onClick={()=>openDmTo(u)} disabled={u.socketId === socketRef.current?.id}>
+                      Privado
                     </button>
                   </div>
-                );
-              })}
+                </div>
+              ))}
             </div>
-          </div>
-        </div>
 
-        <div className="chat-main">
-          <div className="messages" ref={listRef}>
-            {msgs.map(m=>(
-              <div key={m.id} className={"msg " + (m.nick === nick.trim() ? "me" : "")}>
-                <div className="msg-top">
-                  <span className="nick">{m.nick}</span>
-                  <span className="time">{nowTime(m.ts)}</span>
-                </div>
-
-                {m.replyTo && (
-                  <div className="bubble" style={{ opacity:.92, borderStyle:"dashed", marginBottom:8 }}>
-                    <div style={{ fontSize:12, color:"rgba(233,238,247,.68)" }}>
-                      Respondendo <b>{m.replyTo.nick}</b>
-                    </div>
-                    <div className="mono" style={{ marginTop:6 }}>
-                      {m.replyTo.preview}
-                    </div>
-                  </div>
-                )}
-
-                {m.type === "text" && (
-                  <div
-                    className="bubble"
-                    onClick={()=>setReplyFromMessage(m)}
-                    onDoubleClick={(ev)=>openPickerForMessage(ev, m, false)}
-                    title="Clique para responder • Duplo clique para reagir"
-                  >
-                    {m.content}
-                  </div>
-                )}
-
-                {m.type === "image" && (
-                  <div
-                    className="bubble media"
-                    onClick={()=>setReplyFromMessage(m)}
-                    onDoubleClick={(ev)=>openPickerForMessage(ev, m, false)}
-                    title="Clique para responder • Duplo clique para reagir"
-                  >
-                    <img src={m.content} alt="imagem" />
-                  </div>
-                )}
-
-                {m.type === "audio" && (
-                  <div
-                    className="bubble media"
-                    onClick={()=>setReplyFromMessage(m)}
-                    onDoubleClick={(ev)=>openPickerForMessage(ev, m, false)}
-                    title="Clique para responder • Duplo clique para reagir"
-                  >
-                    <audio controls src={m.content} />
-                  </div>
-                )}
-
-                <div className="reactions" style={{ marginTop:8 }}>
-                  {m.reactions && Object.keys(m.reactions).map(k=>(
-                    <span key={k} className="rchip">{k} {m.reactions[k]}</span>
-                  ))}
-                </div>
-              </div>
-            ))}
-
-            {msgs.length === 0 && (
-              <div className="empty">
-                Nenhuma mensagem ainda. Seja o primeiro a falar 🙂
-              </div>
-            )}
-          </div>
-
-          {reply && (
-            <div style={{
-              padding:"10px 12px",
-              borderTop:"1px solid rgba(255,255,255,.08)",
-              background:"rgba(12,18,32,.55)"
-            }}>
-              <div style={{ display:"flex", justifyContent:"space-between", gap:10, alignItems:"center" }}>
-                <div style={{ fontSize:12.5, color:"rgba(233,238,247,.68)" }}>
-                  Respondendo <b>{reply.nick}</b>: <span className="mono">{reply.preview}</span>
-                </div>
-                <button className="btn" onClick={()=>setReply(null)}>Cancelar</button>
-              </div>
+            <div style={{ marginTop: 14 }} className="muted">
+              Sala: <span className="pill mono">{room?.id || roomId}</span>
             </div>
-          )}
-
-          <div className="composer">
-            <input
-              value={text}
-              onChange={(e)=>setText(e.target.value)}
-              placeholder="Digite uma mensagem..."
-              onKeyDown={(e)=>{ if(e.key==="Enter") sendText(); }}
-            />
-
-            <label className="btn icon" title="Enviar foto">
-              📷
-              <input
-                type="file"
-                accept="image/*"
-                hidden
-                onChange={(e)=>sendImage(e.target.files?.[0])}
-              />
-            </label>
-
-            <button className="btn icon" onClick={toggleAudio} title="Áudio (até 10s)">🎙️</button>
-            <button className="btn primary" onClick={sendText}>Enviar</button>
           </div>
         </div>
       </main>
 
-      {/* Emoji Picker (retrátil) */}
-      {picker && (
-        <div onClick={closePicker} style={{ position:"fixed", inset:0, zIndex:70 }}>
-          <div
-            onClick={(e)=>e.stopPropagation()}
-            style={{
-              position:"fixed",
-              left: Math.min(picker.x, window.innerWidth - 260),
-              top: Math.min(picker.y, window.innerHeight - 120),
-              padding:10,
-              borderRadius:14,
-              border:"1px solid rgba(255,255,255,.10)",
-              background:"rgba(15,22,36,.92)",
-              boxShadow:"0 10px 40px rgba(0,0,0,.45)",
-              display:"flex",
-              gap:8,
-              flexWrap:"wrap",
-              maxWidth: 260
-            }}
-          >
-            {QUICK_REACTIONS.map(e=>(
-              <button key={e} className="react" onClick={()=>reactPick(e)}>{e}</button>
-            ))}
+      {/* DM modal */}
+      <Modal open={openDm} title="Mensagem privada" onClose={()=>setOpenDm(false)}>
+        <form onSubmit={sendDm} className="form">
+          <div className="muted">
+            Para: <b style={{ color:"var(--text)" }}>{dmTarget?.nick || "—"}</b>
           </div>
-        </div>
-      )}
-
-      {/* Modal: Entrar no Geral / Grupo */}
-      <Modal open={openAuth} title={mode==="public" ? "Entrar no Geral" : "Entrar no grupo"}>
-        <form onSubmit={enter} className="form">
           <label>
-            Apelido
-            <input
-              value={nick}
-              onChange={(e)=>setNick(e.target.value)}
-              required
-              minLength={2}
-              maxLength={18}
-              placeholder="Ex: Lucas"
+            Mensagem
+            <textarea
+              value={dmText}
+              onChange={(e)=>setDmText(e.target.value)}
+              placeholder="Escreva sua mensagem privada…"
+              maxLength={1200}
             />
           </label>
-
-          {mode==="group" && (
-            <label>
-              Senha do grupo
-              <input
-                value={password}
-                onChange={(e)=>setPassword(e.target.value)}
-                type="password"
-                required
-                minLength={3}
-                placeholder="Senha"
-              />
-            </label>
-          )}
-
           <div className="row">
-            <button type="button" className="btn" onClick={()=>nav("/")}>Voltar</button>
-            <button className="btn primary" type="submit">Entrar</button>
+            <button type="button" className="btn" onClick={()=>setOpenDm(false)}>Cancelar</button>
+            <button className="btn primary" type="submit" disabled={!dmText.trim()}>
+              Enviar
+            </button>
+          </div>
+          <div className="muted" style={{ marginTop: 8 }}>
+            Observação: se o servidor não tiver DM habilitado ainda, o envio será recusado.
           </div>
         </form>
       </Modal>
-
-      {/* Modal: DM */}
-      <Modal open={dmOpen} title={dmPeer ? `Privado com ${dmPeer.nick}` : "Privado"}>
-        <div style={{ display:"grid", gap:10 }}>
-          <div
-            ref={dmListRef}
-            style={{
-              height: 360,
-              overflow:"auto",
-              padding:10,
-              border:"1px solid rgba(255,255,255,.10)",
-              borderRadius:14,
-              background:"rgba(255,255,255,.03)"
-            }}
-          >
-            {dmMsgs.map(m=>(
-              <div key={m.id} style={{ marginBottom: 10 }}>
-                <div style={{ display:"flex", justifyContent:"space-between", fontSize:12, color:"rgba(233,238,247,.68)" }}>
-                  <b style={{ color:"#e9eef7" }}>{m.nick}</b>
-                  <span>{nowTime(m.ts)}</span>
-                </div>
-
-                {m.replyTo && (
-                  <div className="bubble" style={{ opacity:.92, borderStyle:"dashed", marginTop:6 }}>
-                    <div style={{ fontSize:12, color:"rgba(233,238,247,.68)" }}>
-                      Respondendo <b>{m.replyTo.nick}</b>
-                    </div>
-                    <div className="mono" style={{ marginTop:6 }}>{m.replyTo.preview}</div>
-                  </div>
-                )}
-
-                <div
-                  className="bubble"
-                  style={{ marginTop:6 }}
-                  onDoubleClick={(ev)=>openPickerForMessage(ev, m, true)}
-                  title="Duplo clique para reagir"
-                >
-                  {m.type === "text" ? m.content : (m.type === "image" ? "[imagem]" : "[áudio]")}
-                </div>
-
-                <div className="reactions" style={{ marginTop:6 }}>
-                  {m.reactions && Object.keys(m.reactions).map(k=>(
-                    <span key={k} className="rchip">{k} {m.reactions[k]}</span>
-                  ))}
-                </div>
-              </div>
-            ))}
-            {dmMsgs.length === 0 && <div className="muted">Nenhuma mensagem privada ainda.</div>}
-          </div>
-
-          <div style={{ display:"flex", gap:10 }}>
-            <input
-              value={dmText}
-              onChange={(e)=>setDmText(e.target.value)}
-              placeholder="Digite no privado..."
-              style={{
-                flex:1,
-                borderRadius:12,
-                border:"1px solid rgba(255,255,255,.10)",
-                background:"rgba(255,255,255,.03)",
-                color:"#e9eef7",
-                padding:"10px 12px",
-                outline:"none"
-              }}
-              onKeyDown={(e)=>{ if(e.key==="Enter") sendDmText(); }}
-            />
-            <button className="btn primary" onClick={sendDmText}>Enviar</button>
-            <button className="btn" onClick={()=>setDmOpen(false)}>Fechar</button>
-          </div>
-        </div>
-      </Modal>
     </div>
   );
-}
-
-function toDataUrl(file){
-  return new Promise((resolve, reject)=>{
-    const fr = new FileReader();
-    fr.onload = ()=>resolve(String(fr.result));
-    fr.onerror = reject;
-    fr.readAsDataURL(file);
-  });
-}
-
-function blobToDataUrl(blob){
-  return new Promise((resolve, reject)=>{
-    const fr = new FileReader();
-    fr.onload = ()=>resolve(String(fr.result));
-    fr.onerror = reject;
-    fr.readAsDataURL(blob);
-  });
 }

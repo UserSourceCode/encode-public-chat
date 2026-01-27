@@ -3,9 +3,6 @@ import { useNavigate } from "react-router-dom";
 import Modal from "../ui/Modal.jsx";
 import Toast from "../ui/Toast.jsx";
 
-/* =======================
-   Utils
-======================= */
 function fmtTime(ts){
   if(!ts) return "—";
   return new Date(ts).toLocaleString("pt-BR", {
@@ -14,7 +11,6 @@ function fmtTime(ts){
   });
 }
 function fmtSince(ts){
-  if(!ts) return "—";
   const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
   const h = Math.floor(s/3600);
   const m = Math.floor((s%3600)/60);
@@ -22,7 +18,7 @@ function fmtSince(ts){
   return h>0 ? `${h}h ${m}m` : `${m}m ${ss}s`;
 }
 function fmtDur(ms){
-  const s = Math.max(0, Math.floor((ms||0)/1000));
+  const s = Math.max(0, Math.floor(ms/1000));
   const h = Math.floor(s/3600);
   const m = Math.floor((s%3600)/60);
   const ss = s%60;
@@ -40,142 +36,9 @@ function fmtBytes(b){
   const gb = mb / 1024;
   return `${gb.toFixed(2)} GB`;
 }
-function clamp01(x){ return Math.max(0, Math.min(1, x)); }
-
-function seriesStats(arr){
-  const a = Array.isArray(arr) ? arr : [];
-  if(!a.length) return { min:0, max:0, last:0, avg:0 };
-  let min = Infinity, max = -Infinity, sum = 0;
-  for(const v of a){
-    const n = Number(v||0);
-    min = Math.min(min, n);
-    max = Math.max(max, n);
-    sum += n;
-  }
-  return { min, max, last: Number(a[a.length-1]||0), avg: sum/a.length };
-}
-
-/* =======================
-   Mini Charts (SVG)
-======================= */
-function LineAreaChart({ data=[], height=78, padding=8, labelLeft="", labelRight="", asCount=true }){
-  const w = 320; // viewBox width
-  const h = height;
-  const a = Array.isArray(data) ? data.map(x=>Number(x||0)) : [];
-  const { max } = seriesStats(a);
-  const m = Math.max(1, max);
-
-  const innerW = w - padding*2;
-  const innerH = h - padding*2;
-
-  const pts = a.map((v,i)=>{
-    const x = padding + (a.length<=1 ? 0 : (i/(a.length-1))*innerW);
-    const y = padding + (1 - (v/m))*innerH;
-    return { x, y, v };
-  });
-
-  const dLine = pts.map((p,i)=>`${i===0?"M":"L"} ${p.x.toFixed(2)} ${p.y.toFixed(2)}`).join(" ");
-  const dArea = `${dLine} L ${(padding+innerW).toFixed(2)} ${(padding+innerH).toFixed(2)} L ${padding.toFixed(2)} ${(padding+innerH).toFixed(2)} Z`;
-
-  const last = a.length ? a[a.length-1] : 0;
-
-  return (
-    <div className="chart">
-      <div className="chart-head">
-        <span className="muted">{labelLeft}</span>
-        <span className="badge mono">{asCount ? String(last) : fmtDur(last)}</span>
-        <span className="muted">{labelRight}</span>
-      </div>
-
-      <svg viewBox={`0 0 ${w} ${h}`} width="100%" height={h} className="svgchart" role="img" aria-label="Gráfico">
-        <defs>
-          <linearGradient id="gradA" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="currentColor" stopOpacity="0.22" />
-            <stop offset="100%" stopColor="currentColor" stopOpacity="0.02" />
-          </linearGradient>
-        </defs>
-
-        {/* baseline */}
-        <path d={`M ${padding} ${padding+innerH} L ${padding+innerW} ${padding+innerH}`} className="gridline" />
-        {/* area */}
-        <path d={dArea} fill="url(#gradA)" />
-        {/* line */}
-        <path d={dLine} className="line" />
-        {/* last dot */}
-        {pts.length>0 && (
-          <circle cx={pts[pts.length-1].x} cy={pts[pts.length-1].y} r="3.4" className="dot" />
-        )}
-      </svg>
-    </div>
-  );
-}
-
-function PieChart({ parts=[], size=110 }){
-  // parts: [{label, value}]
-  const total = parts.reduce((s,p)=>s+Math.max(0,Number(p.value||0)),0) || 1;
-  const r = 42;
-  const cx = 55, cy = 55;
-  const C = 2*Math.PI*r;
-
-  let acc = 0;
-  const segs = parts.map((p, idx)=>{
-    const v = Math.max(0, Number(p.value||0));
-    const frac = v / total;
-    const len = frac * C;
-    const dash = `${len.toFixed(2)} ${(C-len).toFixed(2)}`;
-    const off = (C*acc);
-    acc += frac;
-    return { ...p, dash, off, idx };
-  });
-
-  return (
-    <div className="pie">
-      <svg viewBox="0 0 110 110" width={size} height={size} className="svgpie" role="img" aria-label="Pizza">
-        <circle cx={cx} cy={cy} r={r} className="pie-bg" />
-        {segs.map((s)=>(
-          <circle
-            key={s.idx}
-            cx={cx} cy={cy} r={r}
-            className={`pie-seg seg-${s.idx%4}`}
-            strokeDasharray={s.dash}
-            strokeDashoffset={(-s.off).toFixed(2)}
-          />
-        ))}
-        <circle cx={cx} cy={cy} r={r-12} className="pie-hole" />
-        <text x={55} y={58} textAnchor="middle" className="pie-text">{total}</text>
-        <text x={55} y={74} textAnchor="middle" className="pie-sub">salas</text>
-      </svg>
-
-      <div className="pie-legend">
-        {parts.map((p, idx)=>(
-          <div key={idx} className="legend-item">
-            <span className={`legend-dot seg-${idx%4}`} />
-            <span>{p.label}</span>
-            <b>{p.value}</b>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-/* =======================
-   Page
-======================= */
-const TABS = [
-  { id:"visao", label:"Visão geral" },
-  { id:"online", label:"Online" },
-  { id:"sessoes", label:"Sessões" },
-  { id:"mensagens", label:"Mensagens" },
-  { id:"memoria", label:"Memória" },
-  { id:"salas", label:"Salas & Grupos" },
-  { id:"moderacao", label:"Moderação" },
-];
 
 export default function Admin(){
   const nav = useNavigate();
-
-  const [tab, setTab] = useState("visao");
 
   const [toast, setToast] = useState("");
   const [openLogin, setOpenLogin] = useState(false);
@@ -187,16 +50,20 @@ export default function Admin(){
   const [metrics, setMetrics] = useState(null);
   const [loading, setLoading] = useState(false);
 
-  // Room detail modal
-  const [roomOpen, setRoomOpen] = useState(false);
+  // tabs do admin
+  const [tab, setTab] = useState("visao"); // visao | salas | moderacao | ram
+
+  // modal sala
+  const [openRoom, setOpenRoom] = useState(false);
   const [roomDetail, setRoomDetail] = useState(null);
   const [roomLoading, setRoomLoading] = useState(false);
 
-  // Moderação modal
-  const [modOpen, setModOpen] = useState(false);
-  const [modTarget, setModTarget] = useState(null); // { socketId, nick, roomId }
-  const [modMsg, setModMsg] = useState("Por favor, respeite as regras. Caso continue, seu acesso poderá ser bloqueado.");
-  const [banMinutes, setBanMinutes] = useState(30);
+  // moderação (actions)
+  const [actionModal, setActionModal] = useState(false);
+  const [actionTarget, setActionTarget] = useState(null); // {socketId,nick}
+  const [actionType, setActionType] = useState("warn"); // warn|kick|ban
+  const [actionMsg, setActionMsg] = useState("");
+  const [banMinutes, setBanMinutes] = useState(60);
 
   const isAuthed = useMemo(()=>{
     if(!token) return false;
@@ -252,12 +119,14 @@ export default function Admin(){
     setToken("");
     setExp(0);
     setMetrics(null);
+    setRoomDetail(null);
+    setOpenRoom(false);
     setToast("Sessão encerrada.");
   }
 
-  async function loadMetrics({ silent=false } = {}){
+  async function loadMetrics(){
     if(!isAuthed) return;
-    if(!silent) setLoading(true);
+    setLoading(true);
     try{
       const j = await api("/api/admin/metrics");
       setMetrics(j);
@@ -268,7 +137,7 @@ export default function Admin(){
         logout();
       }
     }finally{
-      if(!silent) setLoading(false);
+      setLoading(false);
     }
   }
 
@@ -278,32 +147,24 @@ export default function Admin(){
       return;
     }
     loadMetrics();
-    const t = setInterval(()=>loadMetrics({ silent:true }), 2000);
+    const t = setInterval(loadMetrics, 2000);
     return ()=>clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAuthed]);
 
-  const ram = metrics?.ram || {};
-  const uptimeSec = metrics?.uptimeSec || 0;
-  const seriesOnline = metrics?.series?.onlineLast60 || [];
-  const seriesMsgs = metrics?.series?.msgsLast60 || [];
-
-  const roomsList = metrics?.byRoom || [];
-  const publicCount = roomsList.filter(r=>r.type==="public").length;
-  const groupCount = roomsList.filter(r=>r.type==="group").length;
-  const dmCount = roomsList.filter(r=>r.type==="dm").length;
-
-  async function openRoom(id){
+  async function openRoomDetails(id){
     if(!id) return;
-    setRoomOpen(true);
-    setRoomDetail(null);
+    if(!isAuthed) return;
+
+    setOpenRoom(true);
     setRoomLoading(true);
+    setRoomDetail(null);
     try{
       const j = await api(`/api/admin/room/${encodeURIComponent(id)}`);
-      setRoomDetail(j);
+      setRoomDetail(j.room);
     }catch(e){
       setToast(e.message || "Erro ao abrir sala");
-      setRoomOpen(false);
+      setOpenRoom(false);
     }finally{
       setRoomLoading(false);
     }
@@ -316,139 +177,102 @@ export default function Admin(){
         body: JSON.stringify(partial)
       });
       setToast("Configuração atualizada.");
-      setMetrics(m => m ? ({...m, flags: j.flags}) : m);
-      await loadMetrics({ silent:true });
+      setMetrics(prev => prev ? ({ ...prev, flags: { ...prev.flags, ...j.flags } }) : prev);
+      loadMetrics();
     }catch(e){
-      setToast(e.message || "Falha ao atualizar flags");
+      setToast(e.message || "Falha ao atualizar flags.");
     }
   }
 
-  async function toggleFreezeRoom(roomId, freeze){
+  async function freezeRoom(id, freeze){
     try{
-      await api(`/api/admin/room/${encodeURIComponent(roomId)}/freeze`, {
+      await api(`/api/admin/room/${encodeURIComponent(id)}/freeze`, {
         method:"POST",
         body: JSON.stringify({ freeze })
       });
       setToast(freeze ? "Sala congelada." : "Sala descongelada.");
-      await loadMetrics({ silent:true });
-      if(roomOpen && roomDetail?.room?.id === roomId){
-        await openRoom(roomId);
+      loadMetrics();
+      if(roomDetail?.id === id){
+        setRoomDetail(prev => prev ? ({ ...prev, frozen: freeze }) : prev);
       }
     }catch(e){
-      setToast(e.message || "Falha ao congelar/descongelar");
+      setToast(e.message || "Falha ao congelar sala.");
     }
   }
 
-  async function deleteGroup(roomId){
-    if(!confirm("Tem certeza que deseja ENCERRAR este grupo? Isso desconecta todos e apaga as mensagens.")) return;
+  async function deleteGroup(id){
+    if(!id) return;
+    const ok = window.confirm("Tem certeza que deseja excluir este grupo? Os usuários serão desconectados.");
+    if(!ok) return;
+
     try{
-      await api(`/api/admin/room/${encodeURIComponent(roomId)}`, { method:"DELETE" });
-      setToast("Grupo encerrado.");
-      setRoomOpen(false);
-      await loadMetrics();
+      await api(`/api/admin/room/${encodeURIComponent(id)}`, { method:"DELETE" });
+      setToast("Grupo excluído.");
+      setOpenRoom(false);
+      setRoomDetail(null);
+      loadMetrics();
     }catch(e){
-      setToast(e.message || "Falha ao encerrar grupo");
+      setToast(e.message || "Falha ao excluir grupo.");
     }
   }
 
-  function openMod(user, roomId){
-    setModTarget({ socketId: user.socketId, nick: user.nick, roomId });
-    setModOpen(true);
+  function openAction(type, user){
+    setActionType(type);
+    setActionTarget(user);
+    setActionMsg(type === "warn" ? "Por favor, mantenha o respeito e siga as regras." :
+                 type === "kick" ? "Você foi removido pelo administrador." :
+                 "Acesso bloqueado pelo administrador.");
+    setBanMinutes(60);
+    setActionModal(true);
   }
 
-  async function doWarn(){
-    if(!modTarget?.socketId) return;
+  async function runAction(e){
+    e?.preventDefault?.();
+    if(!actionTarget?.socketId) return;
+
     try{
-      await api("/api/admin/warn", {
-        method:"POST",
-        body: JSON.stringify({ socketId: modTarget.socketId, message: modMsg })
-      });
-      setToast("Aviso enviado.");
-      setModOpen(false);
-    }catch(e){
-      setToast(e.message || "Falha ao enviar aviso");
-    }
-  }
-  async function doKick(){
-    if(!modTarget?.socketId) return;
-    try{
-      await api("/api/admin/kick", {
-        method:"POST",
-        body: JSON.stringify({ socketId: modTarget.socketId, message: modMsg })
-      });
-      setToast("Usuário removido.");
-      setModOpen(false);
-      await loadMetrics({ silent:true });
-    }catch(e){
-      setToast(e.message || "Falha ao remover");
-    }
-  }
-  async function doBan(){
-    if(!modTarget?.socketId) return;
-    try{
-      await api("/api/admin/ban-ip", {
-        method:"POST",
-        body: JSON.stringify({
-          socketId: modTarget.socketId,
-          minutes: Number(banMinutes || 0),
-          reason: modMsg
-        })
-      });
-      setToast("IP banido.");
-      setModOpen(false);
-      await loadMetrics({ silent:true });
-    }catch(e){
-      setToast(e.message || "Falha ao banir");
+      if(actionType === "warn"){
+        await api("/api/admin/warn", {
+          method:"POST",
+          body: JSON.stringify({
+            socketId: actionTarget.socketId,
+            message: actionMsg
+          })
+        });
+        setToast("Aviso enviado.");
+      }else if(actionType === "kick"){
+        await api("/api/admin/kick", {
+          method:"POST",
+          body: JSON.stringify({
+            socketId: actionTarget.socketId,
+            message: actionMsg
+          })
+        });
+        setToast("Usuário removido.");
+      }else{
+        await api("/api/admin/ban-ip", {
+          method:"POST",
+          body: JSON.stringify({
+            socketId: actionTarget.socketId,
+            minutes: Number(banMinutes || 0),
+            reason: actionMsg
+          })
+        });
+        setToast("IP banido.");
+      }
+      setActionModal(false);
+      loadMetrics();
+      if(roomDetail?.id){
+        // recarrega detalhes se modal estava aberto (para atualizar lista)
+        openRoomDetails(roomDetail.id);
+      }
+    }catch(e2){
+      setToast(e2.message || "Falha na ação.");
     }
   }
 
-  // ---------------- UI blocks ----------------
-  const flagsUI = (
-    <div className="admin-card">
-      <h2>Controles</h2>
-      <div className="controls">
-        <div className="control">
-          <div>
-            <div className="control-title">Criação de grupos</div>
-            <div className="muted">{metrics?.flags?.groupCreationEnabled ? "LIBERADA" : "BLOQUEADA"}</div>
-          </div>
-          <button
-            className={"btn " + (metrics?.flags?.groupCreationEnabled ? "danger" : "primary")}
-            onClick={()=>setFlags({ groupCreationEnabled: !metrics?.flags?.groupCreationEnabled })}
-          >
-            {metrics?.flags?.groupCreationEnabled ? "Bloquear" : "Liberar"}
-          </button>
-        </div>
-
-        <div className="control">
-          <div>
-            <div className="control-title">Sala Geral</div>
-            <div className="muted">{metrics?.flags?.generalFrozen ? "CONGELADA (ninguém envia msg)" : "ATIVA"}</div>
-          </div>
-          <button
-            className={"btn " + (metrics?.flags?.generalFrozen ? "primary" : "danger")}
-            onClick={()=>setFlags({ generalFrozen: !metrics?.flags?.generalFrozen })}
-          >
-            {metrics?.flags?.generalFrozen ? "Descongelar" : "Congelar"}
-          </button>
-        </div>
-      </div>
-      <div className="muted" style={{ marginTop: 10 }}>
-        Congelar = impede envio de mensagens (continua lendo).
-      </div>
-    </div>
-  );
-
-  const headerRight = (
-    <div className="top-actions">
-      <button className="btn" onClick={()=>loadMetrics()} disabled={!isAuthed || loading}>
-        {loading ? "Atualizando..." : "Atualizar"}
-      </button>
-      <button className="btn danger" onClick={logout} disabled={!isAuthed}>
-        Sair
-      </button>
-    </div>
-  );
+  const ram = metrics?.ram || {};
+  const uptimeSec = metrics?.uptimeSec || 0;
 
   return (
     <div className="shell">
@@ -459,306 +283,256 @@ export default function Admin(){
           <div className="logo">EP</div>
           <div>
             <div className="brand-title">Área Reservada</div>
-            <div className="brand-sub">Painel administrativo</div>
+            <div className="brand-sub">Admin • Monitoramento e moderação</div>
           </div>
         </div>
-        {headerRight}
+
+        <div className="top-actions">
+          <button className="btn" onClick={loadMetrics} disabled={!isAuthed || loading}>
+            {loading ? "Atualizando..." : "Atualizar"}
+          </button>
+          <button className="btn danger" onClick={logout} disabled={!isAuthed}>
+            Sair do admin
+          </button>
+        </div>
       </header>
 
       <main className="admin-shell">
-        {/* Hero */}
         <div className="admin-hero">
           <div>
-            <div className="admin-title">Admin • Monitoramento em tempo real</div>
+            <div className="admin-title">Painel do Administrador</div>
             <div className="admin-sub">
-              Boot: <b>{metrics?.bootAt ? fmtSince(metrics.bootAt) : "—"}</b>
-              {" "}• Uptime: <b>{uptimeSec}s</b>
-              {" "}• Atualiza a cada 2s
+              Desde o boot: <b>{metrics?.bootAt ? fmtSince(metrics.bootAt) : "—"}</b> • Uptime: <b>{uptimeSec}s</b> • Atualiza a cada 2s
             </div>
           </div>
           <div className="admin-tools">
             <span className="badge mono">Sessão: {exp ? fmtTime(exp) : "—"}</span>
+            <span className="badge">Online: <b>{metrics?.onlineNow ?? "—"}</b></span>
           </div>
         </div>
 
-        {/* Tabs */}
+        {/* TABS */}
         <div className="tabs">
-          {TABS.map(t=>(
-            <button
-              key={t.id}
-              className={"tab " + (tab===t.id ? "active" : "")}
-              onClick={()=>setTab(t.id)}
-              type="button"
-            >
-              {t.label}
-            </button>
-          ))}
+          <button className={"tab " + (tab==="visao" ? "active" : "")} onClick={()=>setTab("visao")}>Visão geral</button>
+          <button className={"tab " + (tab==="salas" ? "active" : "")} onClick={()=>setTab("salas")}>Salas</button>
+          <button className={"tab " + (tab==="moderacao" ? "active" : "")} onClick={()=>setTab("moderacao")}>Moderação</button>
+          <button className={"tab " + (tab==="ram" ? "active" : "")} onClick={()=>setTab("ram")}>RAM</button>
         </div>
 
-        {/* Content */}
-        {!metrics ? (
-          <div className="admin-card">
-            <h2>Carregando…</h2>
-            <div className="muted">Aguardando dados do servidor.</div>
+        {/* VISÃO GERAL */}
+        {tab === "visao" && (
+          <div className="admin-grid">
+            <div className="admin-card">
+              <h2>Online agora</h2>
+              <div className="admin-badges">
+                <span className="badge good">Online: <b>{metrics?.onlineNow ?? "—"}</b></span>
+                <span className="badge">Salas: <b>{metrics?.roomsTotal ?? "—"}</b></span>
+                <span className="badge">Grupos: <b>{metrics?.groupsTotal ?? "—"}</b></span>
+                <span className="badge">DMs ativos: <b>{metrics?.dmActive ?? "—"}</b></span>
+              </div>
+              <div className="muted" style={{ marginTop: 10 }}>
+                Contagem do servidor atual (1 instância). Sem persistência: reiniciou, zera.
+              </div>
+            </div>
+
+            <div className="admin-card">
+              <h2>Picos</h2>
+              <div className="admin-badges">
+                <span className="badge warn">Pico online: <b>{metrics?.peakOnline ?? "—"}</b></span>
+                <span className="badge mono">Quando: {metrics?.peakOnlineAt ? fmtTime(metrics.peakOnlineAt) : "—"}</span>
+                <span className="badge">Pico (últ. 60s): <b>{metrics?.peakOnlineLast60 ?? "—"}</b></span>
+              </div>
+              <div className="muted" style={{ marginTop: 10 }}>
+                Picos por sala aparecem na aba “Salas”.
+              </div>
+            </div>
+
+            <div className="admin-card">
+              <h2>Tempo médio de sessão</h2>
+              <div className="admin-badges">
+                <span className="badge good">Online agora: <b>{metrics ? fmtDur(metrics.avgSessionNowMs || 0) : "—"}</b></span>
+                <span className="badge">Histórico (boot): <b>{metrics ? fmtDur(metrics.avgSessionAllMs || 0) : "—"}</b></span>
+                <span className="badge mono">Sessões encerradas: <b>{metrics?.sessionsClosedCount ?? "—"}</b></span>
+              </div>
+              <div className="muted" style={{ marginTop: 10 }}>
+                Histórico inclui sessões encerradas + ativas (desde o boot).
+              </div>
+            </div>
+
+            <div className="admin-card">
+              <h2>Mensagens por minuto</h2>
+              <div className="admin-badges">
+                <span className="badge good">Agora (últ. 60s): <b>{metrics?.msgsPerMinNow ?? "—"}</b></span>
+                <span className="badge warn">Pico: <b>{metrics?.peakMsgsPerMin ?? "—"}</b></span>
+                <span className="badge mono">Quando: {metrics?.peakMsgsPerMinAt ? fmtTime(metrics.peakMsgsPerMinAt) : "—"}</span>
+              </div>
+              <div className="muted" style={{ marginTop: 10 }}>
+                Conta mensagens do Geral + Grupos + DMs.
+              </div>
+            </div>
+
+            <div className="admin-card">
+              <h2>Controles</h2>
+              <div className="controls">
+                <div className="control">
+                  <div>
+                    <div className="control-title">Criação de grupos</div>
+                    <div className="muted">{metrics?.flags?.groupCreationEnabled ? "LIBERADA" : "BLOQUEADA"}</div>
+                  </div>
+                  <button
+                    className={"btn " + (metrics?.flags?.groupCreationEnabled ? "danger" : "primary")}
+                    onClick={()=>setFlags({ groupCreationEnabled: !metrics?.flags?.groupCreationEnabled })}
+                  >
+                    {metrics?.flags?.groupCreationEnabled ? "Bloquear" : "Liberar"}
+                  </button>
+                </div>
+
+                <div className="control">
+                  <div>
+                    <div className="control-title">Congelar Geral</div>
+                    <div className="muted">{metrics?.flags?.generalFrozen ? "CONGELADO" : "ATIVO"}</div>
+                  </div>
+                  <button
+                    className={"btn " + (metrics?.flags?.generalFrozen ? "primary" : "danger")}
+                    onClick={()=>setFlags({ generalFrozen: !metrics?.flags?.generalFrozen })}
+                  >
+                    {metrics?.flags?.generalFrozen ? "Descongelar" : "Congelar"}
+                  </button>
+                </div>
+              </div>
+
+              <div className="muted" style={{ marginTop: 10 }}>
+                Dica: na aba “Salas”, você congela/descongela qualquer sala individual.
+              </div>
+            </div>
+
+            <div className="admin-card">
+              <h2>Dica</h2>
+              <div className="muted">
+                Clique em uma sala na aba “Salas” para abrir detalhes: usuários, tempo ativa, ações rápidas e mais.
+              </div>
+            </div>
           </div>
-        ) : (
-          <>
-            {/* VISÃO GERAL */}
-            {tab==="visao" && (
-              <div className="admin-grid">
-                {flagsUI}
+        )}
 
-                <div className="admin-card">
-                  <h2>Resumo</h2>
-                  <div className="admin-badges">
-                    <span className="badge good">Online: <b>{metrics.onlineNow}</b></span>
-                    <span className="badge warn">Pico global: <b>{metrics.peakOnline}</b></span>
-                    <span className="badge mono">Quando: <b>{metrics.peakOnlineAt ? fmtTime(metrics.peakOnlineAt) : "—"}</b></span>
-                  </div>
+        {/* SALAS */}
+        {tab === "salas" && (
+          <div className="admin-card full">
+            <h2>Salas (geral / grupos / dms)</h2>
 
-                  <div style={{ marginTop: 12 }}>
-                    <LineAreaChart
-                      data={seriesOnline}
-                      labelLeft="Online (últimos 60s)"
-                      labelRight={`pico60: ${metrics.peakOnlineLast60}`}
-                    />
-                  </div>
-                </div>
+            <table className="admin-table clickable-rows">
+              <thead>
+                <tr>
+                  <th>Tipo</th>
+                  <th>Sala</th>
+                  <th>ID</th>
+                  <th>Online agora</th>
+                  <th>Pico sala</th>
+                  <th>Quando</th>
+                  <th>Congelada</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(metrics?.byRoom || []).map(r => (
+                  <tr key={r.id} onClick={()=>openRoomDetails(r.id)}>
+                    <td>
+                      <span className={"badge " + (r.type==="group" ? "warn" : r.type==="dm" ? "danger" : "good")}>
+                        {r.type==="public" ? "Pública" : r.type==="group" ? "Grupo" : "DM"}
+                      </span>
+                    </td>
+                    <td style={{ fontWeight: 900 }}>{r.name}</td>
+                    <td className="mono">{r.id}</td>
+                    <td><b>{r.onlineNow}</b></td>
+                    <td>{r.peakOnline}</td>
+                    <td className="mono">{r.peakOnlineAt ? fmtTime(r.peakOnlineAt) : "—"}</td>
+                    <td>{r.frozen ? "Sim" : "Não"}</td>
+                  </tr>
+                ))}
+                {(!metrics?.byRoom || metrics.byRoom.length===0) && (
+                  <tr><td colSpan="7" className="muted">Sem dados ainda.</td></tr>
+                )}
+              </tbody>
+            </table>
 
-                <div className="admin-card">
-                  <h2>Mensagens</h2>
-                  <div className="admin-badges">
-                    <span className="badge good">Agora (60s): <b>{metrics.msgsPerMinNow}</b></span>
-                    <span className="badge warn">Pico: <b>{metrics.peakMsgsPerMin}</b></span>
-                    <span className="badge mono">Quando: <b>{metrics.peakMsgsPerMinAt ? fmtTime(metrics.peakMsgsPerMinAt) : "—"}</b></span>
-                  </div>
+            <div className="muted" style={{ marginTop: 10 }}>
+              Clique em uma linha para abrir detalhes da sala.
+            </div>
+          </div>
+        )}
 
-                  <div style={{ marginTop: 12 }}>
-                    <LineAreaChart
-                      data={seriesMsgs}
-                      labelLeft="Mensagens (últimos 60s)"
-                      labelRight="(geral + grupos + dms)"
-                    />
-                  </div>
-                </div>
-
-                <div className="admin-card">
-                  <h2>Distribuição de salas</h2>
-                  <PieChart
-                    parts={[
-                      { label:"Públicas", value: publicCount },
-                      { label:"Grupos", value: groupCount },
-                      { label:"DMs", value: dmCount },
-                    ]}
-                  />
-                  <div className="muted" style={{ marginTop: 8 }}>
-                    DMs aparecem quando alguém abre um privado.
-                  </div>
-                </div>
-
-                <div className="admin-card">
-                  <h2>Memória (agora)</h2>
-                  <div className="admin-badges">
-                    <span className="badge">RSS: <b>{fmtBytes(ram.rss)}</b></span>
-                    <span className="badge">Heap: <b>{fmtBytes(ram.heapUsed)}</b> / {fmtBytes(ram.heapTotal)}</span>
-                    <span className="badge">External: <b>{fmtBytes(ram.external)}</b></span>
-                  </div>
-                  <div className="muted" style={{ marginTop: 8 }}>
-                    RSS é a memória total do processo.
-                  </div>
-                </div>
+        {/* MODERAÇÃO */}
+        {tab === "moderacao" && (
+          <div className="admin-grid">
+            <div className="admin-card">
+              <h2>Usuários online (global)</h2>
+              <div className="muted" style={{ marginBottom: 10 }}>
+                Selecione uma sala na aba “Salas” para ver usuários por sala. Aqui é uma visão rápida.
               </div>
-            )}
 
-            {/* ONLINE */}
-            {tab==="online" && (
-              <div className="admin-grid">
-                <div className="admin-card">
-                  <h2>Online agora</h2>
-                  <div className="admin-badges">
-                    <span className="badge good">Online: <b>{metrics.onlineNow}</b></span>
-                    <span className="badge">Salas: <b>{metrics.roomsTotal}</b></span>
-                    <span className="badge">Grupos: <b>{metrics.groupsTotal}</b></span>
-                    <span className="badge">DMs: <b>{metrics.dmActive}</b></span>
-                  </div>
-
-                  <div style={{ marginTop: 12 }}>
-                    <LineAreaChart
-                      data={seriesOnline}
-                      labelLeft="Online (60s)"
-                      labelRight={`pico60: ${metrics.peakOnlineLast60}`}
-                    />
-                  </div>
-
-                  <div className="muted" style={{ marginTop: 8 }}>
-                    Pico global (desde o boot): {metrics.peakOnline} em {metrics.peakOnlineAt ? fmtTime(metrics.peakOnlineAt) : "—"}
-                  </div>
-                </div>
-
-                <div className="admin-card">
-                  <h2>Controles rápidos</h2>
-                  {flagsUI}
-                </div>
-              </div>
-            )}
-
-            {/* SESSÕES */}
-            {tab==="sessoes" && (
-              <div className="admin-grid">
-                <div className="admin-card">
-                  <h2>Tempo médio de sessão</h2>
-                  <div className="admin-badges">
-                    <span className="badge good">Online agora: <b>{fmtDur(metrics.avgSessionNowMs || 0)}</b></span>
-                    <span className="badge">Histórico (boot): <b>{fmtDur(metrics.avgSessionAllMs || 0)}</b></span>
-                    <span className="badge mono">Encerradas: <b>{metrics.sessionsClosedCount}</b></span>
-                  </div>
-                  <div className="muted" style={{ marginTop: 8 }}>
-                    Histórico inclui sessões encerradas + ativas (desde o boot).
-                  </div>
-                </div>
-
-                <div className="admin-card">
-                  <h2>Uptime</h2>
-                  <div className="admin-badges">
-                    <span className="badge mono">Uptime: <b>{uptimeSec}s</b></span>
-                    <span className="badge mono">Boot: <b>{metrics.bootAt ? fmtTime(metrics.bootAt) : "—"}</b></span>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* MENSAGENS */}
-            {tab==="mensagens" && (
-              <div className="admin-grid">
-                <div className="admin-card">
-                  <h2>Mensagens por minuto</h2>
-                  <div className="admin-badges">
-                    <span className="badge good">Agora (60s): <b>{metrics.msgsPerMinNow}</b></span>
-                    <span className="badge warn">Pico: <b>{metrics.peakMsgsPerMin}</b></span>
-                    <span className="badge mono">Quando: <b>{metrics.peakMsgsPerMinAt ? fmtTime(metrics.peakMsgsPerMinAt) : "—"}</b></span>
-                  </div>
-                  <div style={{ marginTop: 12 }}>
-                    <LineAreaChart
-                      data={seriesMsgs}
-                      labelLeft="Mensagens (60s)"
-                      labelRight="tempo real"
-                    />
-                  </div>
-                  <div className="muted" style={{ marginTop: 8 }}>
-                    Conta geral + grupos + DMs.
-                  </div>
-                </div>
-
-                <div className="admin-card">
-                  <h2>Congelar geral</h2>
-                  <div className="muted">Use isso quando houver spam.</div>
-                  <div style={{ marginTop: 10 }}>
-                    <button
-                      className={"btn " + (metrics.flags?.generalFrozen ? "primary" : "danger")}
-                      onClick={()=>setFlags({ generalFrozen: !metrics.flags?.generalFrozen })}
-                    >
-                      {metrics.flags?.generalFrozen ? "Descongelar Geral" : "Congelar Geral"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* MEMÓRIA */}
-            {tab==="memoria" && (
-              <div className="admin-grid">
-                <div className="admin-card">
-                  <h2>Consumo de RAM</h2>
-                  <div className="admin-badges">
-                    <span className="badge">RSS: <b>{fmtBytes(ram.rss)}</b></span>
-                    <span className="badge">Heap usado: <b>{fmtBytes(ram.heapUsed)}</b></span>
-                    <span className="badge">Heap total: <b>{fmtBytes(ram.heapTotal)}</b></span>
-                    <span className="badge">External: <b>{fmtBytes(ram.external)}</b></span>
-                  </div>
-                  <div className="muted" style={{ marginTop: 8 }}>
-                    Se o RSS subir muito, pode ser excesso de uploads (imagem/áudio) — reduza limites.
-                  </div>
-                </div>
-
-                <div className="admin-card">
-                  <h2>Boas práticas</h2>
-                  <ul className="list">
-                    <li>Evite arquivos grandes (áudio/foto) para manter memória baixa.</li>
-                    <li>Grupos e DMs são apagados quando ficam vazios.</li>
-                    <li>Reinício do Render zera picos/histórico (sem persistência).</li>
-                  </ul>
-                </div>
-              </div>
-            )}
-
-            {/* SALAS */}
-            {tab==="salas" && (
-              <>
-                <div className="admin-card">
-                  <h2>Salas (clique para detalhes)</h2>
-                  <div className="muted">Ao clicar em uma sala, você vê usuários, tempo ativa e ações.</div>
-
-                  <table className="admin-table clickable-rows">
-                    <thead>
+              <table className="admin-table">
+                <thead>
+                  <tr>
+                    <th>Apelido</th>
+                    <th>Sala</th>
+                    <th>Ações</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(() => {
+                    // monta lista rápida a partir de byRoom (apenas contagem) não tem nicks.
+                    // então mostramos instrução e levamos o admin para clicar na sala.
+                    return (
                       <tr>
-                        <th>Tipo</th>
-                        <th>Sala</th>
-                        <th>ID</th>
-                        <th>Online</th>
-                        <th>Pico</th>
-                        <th>Congelada</th>
-                        <th>Última atividade</th>
+                        <td colSpan="3" className="muted">
+                          Para moderar usuários (avisar/kick/ban), clique em uma sala na aba “Salas”
+                          e use o modal de detalhes (lá tem a lista completa com botões).
+                        </td>
                       </tr>
-                    </thead>
-                    <tbody>
-                      {(roomsList || []).map(r => (
-                        <tr key={r.id} onClick={()=>openRoom(r.id)}>
-                          <td>
-                            <span className={"badge " + (r.type==="group" ? "warn" : r.type==="dm" ? "danger" : "good")}>
-                              {r.type==="public" ? "Pública" : r.type==="group" ? "Grupo" : "DM"}
-                            </span>
-                          </td>
-                          <td style={{ fontWeight: 900 }}>{r.name}</td>
-                          <td className="mono">{r.id}</td>
-                          <td><b>{r.onlineNow}</b></td>
-                          <td>{r.peakOnline}</td>
-                          <td>{r.frozen ? <span className="badge danger">Sim</span> : <span className="badge good">Não</span>}</td>
-                          <td className="mono">{r.lastActivityAt ? fmtTime(r.lastActivityAt) : "—"}</td>
-                        </tr>
-                      ))}
-                      {(!roomsList || roomsList.length===0) && (
-                        <tr><td colSpan="7" className="muted">Sem dados ainda.</td></tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </>
-            )}
+                    );
+                  })()}
+                </tbody>
+              </table>
+            </div>
 
-            {/* MODERAÇÃO */}
-            {tab==="moderacao" && (
-              <div className="admin-grid">
-                {flagsUI}
-
-                <div className="admin-card">
-                  <h2>Como moderar</h2>
-                  <div className="muted">
-                    Abra uma sala em <b>Salas & Grupos</b>, veja a lista de usuários e clique em “Moderar”.
-                    <br/>
-                    Ações disponíveis: <b>Aviso</b>, <b>Remover</b>, <b>Banir IP</b>.
-                  </div>
-                  <div className="muted" style={{ marginTop: 10 }}>
-                    Obs: ban por IP pode ser impreciso se várias pessoas estiverem na mesma rede.
-                  </div>
-                </div>
+            <div className="admin-card">
+              <h2>Bloqueios (IP)</h2>
+              <div className="muted">
+                IP banido impede o mesmo usuário de voltar (mesmo trocando apelido).<br/>
+                A lista detalhada de bans pode ser adicionada no próximo passo.
               </div>
-            )}
-          </>
+            </div>
+          </div>
+        )}
+
+        {/* RAM */}
+        {tab === "ram" && (
+          <div className="admin-grid">
+            <div className="admin-card">
+              <h2>Consumo de memória (RAM)</h2>
+              <div className="admin-badges">
+                <span className="badge">RSS: <b>{fmtBytes(ram.rss)}</b></span>
+                <span className="badge">Heap usado: <b>{fmtBytes(ram.heapUsed)}</b></span>
+                <span className="badge">Heap total: <b>{fmtBytes(ram.heapTotal)}</b></span>
+                <span className="badge">External: <b>{fmtBytes(ram.external)}</b></span>
+              </div>
+              <div className="muted" style={{ marginTop: 10 }}>
+                RSS é o mais importante (memória total do processo).
+              </div>
+            </div>
+
+            <div className="admin-card">
+              <h2>Observação</h2>
+              <div className="muted">
+                Como o projeto é sem persistência, o consumo sobe conforme mensagens/imagens/áudios
+                e depois cai quando salas ficam vazias e são limpas.
+              </div>
+            </div>
+          </div>
         )}
       </main>
 
-      {/* Modal login */}
-      <Modal open={openLogin} title="Acesso restrito">
+      {/* LOGIN */}
+      <Modal open={openLogin} title="Acesso restrito" onClose={()=>nav("/")}>
         <form onSubmit={login} className="form">
           <label>
             Senha do administrador
@@ -781,112 +555,140 @@ export default function Admin(){
         </form>
       </Modal>
 
-      {/* Modal detalhes sala */}
-      <Modal open={roomOpen} title="Detalhes da sala" onClose={()=>setRoomOpen(false)}>
-        {roomLoading && <div className="muted">Carregando…</div>}
+      {/* MODAL DETALHES SALA */}
+      <Modal open={openRoom} title="Detalhes da sala" onClose={()=>setOpenRoom(false)}>
+        {roomLoading && <div className="muted">Carregando...</div>}
 
-        {!roomLoading && roomDetail?.room && (
+        {!roomLoading && roomDetail && (
           <div className="room-detail">
-            <div className="admin-badges" style={{ marginBottom: 10 }}>
-              <span className="badge mono">ID: <b>{roomDetail.room.id}</b></span>
-              <span className="badge">
-                Tipo: <b>{roomDetail.room.type === "public" ? "Pública" : roomDetail.room.type === "group" ? "Grupo" : "DM"}</b>
+            <div className="admin-badges">
+              <span className="badge">{roomDetail.type==="public" ? "Pública" : roomDetail.type==="group" ? "Grupo" : "DM"}</span>
+              <span className="badge mono">ID: <b>{roomDetail.id}</b></span>
+              <span className="badge">Online: <b>{roomDetail.onlineNow}</b></span>
+              <span className="badge">Mensagens: <b>{roomDetail.messagesCount}</b></span>
+              <span className={"badge " + (roomDetail.frozen ? "warn" : "good")}>
+                {roomDetail.frozen ? "CONGELADA" : "ATIVA"}
               </span>
-              <span className="badge">Online: <b>{roomDetail.room.onlineNow}</b></span>
-              <span className="badge warn">Pico: <b>{roomDetail.room.peak?.peak || 0}</b></span>
-              <span className="badge mono">Pico em: <b>{roomDetail.room.peak?.at ? fmtTime(roomDetail.room.peak.at) : "—"}</b></span>
             </div>
 
-            <div className="admin-card mini">
-              <h3 style={{ marginBottom: 6 }}>{roomDetail.room.name}</h3>
-              <div className="muted">
-                Ativa há: <b>{roomDetail.room.createdAt ? fmtSince(roomDetail.room.createdAt) : "—"}</b>
-                {" "}• Criada em: <b>{roomDetail.room.createdAt ? fmtTime(roomDetail.room.createdAt) : "—"}</b>
-                {" "}• Última atividade: <b>{roomDetail.room.lastActivityAt ? fmtTime(roomDetail.room.lastActivityAt) : "—"}</b>
-              </div>
+            <div className="muted">
+              Criada em: <b style={{ color:"var(--text)" }}>{roomDetail.createdAt ? fmtTime(roomDetail.createdAt) : "—"}</b><br/>
+              Ativa há: <b style={{ color:"var(--text)" }}>{roomDetail.activeForMs!=null ? fmtDur(roomDetail.activeForMs) : "—"}</b><br/>
+              Última atividade: <b style={{ color:"var(--text)" }}>{roomDetail.lastActivityAt ? fmtTime(roomDetail.lastActivityAt) : "—"}</b><br/>
+              Pico: <b style={{ color:"var(--text)" }}>{roomDetail.peak?.peak ?? 0}</b> {roomDetail.peak?.at ? `em ${fmtTime(roomDetail.peak.at)}` : ""}
+            </div>
 
-              <div className="row" style={{ marginTop: 12, gap: 8, flexWrap:"wrap" }}>
+            <div className="row" style={{ justifyContent:"space-between" }}>
+              <div className="admin-badges">
+                <span className="badge">Nome: <b>{roomDetail.name}</b></span>
+              </div>
+              <div className="row" style={{ justifyContent:"flex-end" }}>
                 <button
-                  className={"btn " + (roomDetail.room.frozen ? "primary" : "danger")}
-                  onClick={()=>toggleFreezeRoom(roomDetail.room.id, !roomDetail.room.frozen)}
+                  className={"btn " + (roomDetail.frozen ? "primary" : "danger")}
+                  type="button"
+                  onClick={()=>freezeRoom(roomDetail.id, !roomDetail.frozen)}
                 >
-                  {roomDetail.room.frozen ? "Descongelar sala" : "Congelar sala"}
+                  {roomDetail.frozen ? "Descongelar" : "Congelar"}
                 </button>
 
-                {roomDetail.room.type === "group" && (
-                  <button className="btn danger" onClick={()=>deleteGroup(roomDetail.room.id)}>
-                    Encerrar grupo
+                {roomDetail.type === "group" && (
+                  <button className="btn danger" type="button" onClick={()=>deleteGroup(roomDetail.id)}>
+                    Excluir grupo
                   </button>
                 )}
               </div>
             </div>
 
-            <div className="admin-card mini" style={{ marginTop: 12 }}>
-              <h3>Usuários online</h3>
-              {(roomDetail.room.users || []).length === 0 ? (
-                <div className="muted">Nenhum usuário online nesta sala.</div>
-              ) : (
-                <div className="users-list">
-                  {roomDetail.room.users.map(u => (
-                    <div key={u.socketId} className="user-row">
-                      <div>
-                        <div className="user-nick">{u.nick}</div>
-                        <div className="muted mono">Conectado: {u.connectedAt ? fmtSince(u.connectedAt) : "—"}</div>
+            <div style={{ marginTop: 8 }}>
+              <div style={{ fontWeight: 1000, marginBottom: 8 }}>Usuários na sala</div>
+
+              <div className="users-list">
+                {(!roomDetail.users || roomDetail.users.length===0) && (
+                  <div className="muted">Nenhum usuário nesta sala.</div>
+                )}
+
+                {(roomDetail.users || []).map(u => (
+                  <div key={u.socketId} className="user-row">
+                    <div>
+                      <div className="user-nick">{u.nick}</div>
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        Conectado: {u.connectedAt ? fmtTime(u.connectedAt) : "—"}
                       </div>
-                      <div className="user-actions">
-                        <button className="btn" onClick={()=>openMod(u, roomDetail.room.id)}>Moderar</button>
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        Socket: <span className="mono">{u.socketId}</span>
                       </div>
                     </div>
-                  ))}
-                </div>
-              )}
+
+                    <div className="user-actions">
+                      <button className="btn" type="button" onClick={()=>openAction("warn", u)}>Avisar</button>
+                      <button className="btn danger" type="button" onClick={()=>openAction("kick", u)}>Kick</button>
+                      <button className="btn danger" type="button" onClick={()=>openAction("ban", u)}>Ban IP</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="muted" style={{ marginTop: 10 }}>
+                * “Ban IP” bloqueia o IP do usuário (mesmo se mudar de apelido).
+              </div>
             </div>
           </div>
         )}
+
+        {!roomLoading && !roomDetail && (
+          <div className="muted">Sem detalhes.</div>
+        )}
       </Modal>
 
-      {/* Modal moderação */}
-      <Modal open={modOpen} title="Moderação" onClose={()=>setModOpen(false)}>
-        {!modTarget ? (
-          <div className="muted">Selecione um usuário.</div>
-        ) : (
-          <div className="form">
-            <div className="admin-badges" style={{ marginBottom: 10 }}>
-              <span className="badge">Usuário: <b>{modTarget.nick}</b></span>
-              <span className="badge mono">ID: <b>{modTarget.socketId.slice(0, 8)}…</b></span>
-            </div>
+      {/* MODAL AÇÃO MODERAÇÃO */}
+      <Modal
+        open={actionModal}
+        title={actionType === "warn" ? "Enviar aviso" : actionType === "kick" ? "Remover usuário" : "Banir IP"}
+        onClose={()=>setActionModal(false)}
+      >
+        <form onSubmit={runAction} className="form">
+          <div className="muted">
+            Alvo: <b style={{ color:"var(--text)" }}>{actionTarget?.nick || "—"}</b>{" "}
+            <span className="pill mono">{actionTarget?.socketId || ""}</span>
+          </div>
 
+          {actionType === "ban" && (
             <label>
-              Mensagem (aviso/motivo)
-              <textarea
-                rows={4}
-                value={modMsg}
-                onChange={(e)=>setModMsg(e.target.value)}
-                placeholder="Digite o aviso / motivo"
-              />
-            </label>
-
-            <label>
-              Banir por quantos minutos? (0 = permanente)
+              Duração (minutos) — 0 = permanente
               <input
                 type="number"
-                min={0}
+                min="0"
+                max="43200"
                 value={banMinutes}
                 onChange={(e)=>setBanMinutes(e.target.value)}
               />
             </label>
+          )}
 
-            <div className="row" style={{ gap: 8, flexWrap:"wrap" }}>
-              <button type="button" className="btn" onClick={doWarn}>Enviar aviso</button>
-              <button type="button" className="btn danger" onClick={doKick}>Remover agora</button>
-              <button type="button" className="btn danger" onClick={doBan}>Banir IP</button>
-            </div>
+          <label>
+            Mensagem
+            <textarea
+              value={actionMsg}
+              onChange={(e)=>setActionMsg(e.target.value)}
+              maxLength={220}
+              placeholder="Escreva a mensagem..."
+              required
+            />
+          </label>
 
-            <div className="muted" style={{ marginTop: 10 }}>
-              Ban por IP pode afetar pessoas na mesma rede (ex.: Wi-Fi compartilhado).
-            </div>
+          <div className="row">
+            <button type="button" className="btn" onClick={()=>setActionModal(false)}>Cancelar</button>
+            <button className={"btn " + (actionType === "warn" ? "primary" : "danger")} type="submit">
+              Confirmar
+            </button>
           </div>
-        )}
+
+          <div className="muted" style={{ marginTop: 8 }}>
+            {actionType === "warn" && "Envia um aviso que aparece no chat do usuário."}
+            {actionType === "kick" && "Remove o usuário e desconecta imediatamente."}
+            {actionType === "ban" && "Bane o IP do usuário (não volta nem mudando o apelido)."}
+          </div>
+        </form>
       </Modal>
     </div>
   );
