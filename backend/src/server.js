@@ -22,7 +22,7 @@ const server = http.createServer(app);
 const ORIGIN = process.env.ORIGIN || true;
 const io = new SocketIOServer(server, {
   cors: { origin: ORIGIN },
-  maxHttpBufferSize: 6 * 1024 * 1024
+  maxHttpBufferSize: 6 * 1024 * 1024, // base64 images/audio
 });
 
 // ======================================================
@@ -147,8 +147,6 @@ function sampleOnline() {
   const peak = Math.max(...metrics.onlineWindow);
   metrics.peakOnlineLast60 = peak;
 }
-
-// amostragem contínua (não pesa)
 setInterval(sampleOnline, 1000);
 
 // ---------------- sessões ----------------
@@ -193,7 +191,7 @@ function isRoomFrozen(roomId) {
 // ======================================================
 // BAN / MODERAÇÃO (RAM)
 // ======================================================
-const bansByIp = new Map(); // ip -> { until|null, reason }
+const bansByIp = new Map(); // ip -> { until|null, reason, createdAt }
 
 function getIp(reqOrSocket) {
   const xff = reqOrSocket?.headers?.["x-forwarded-for"];
@@ -273,10 +271,8 @@ function cleanupRoomIfEmpty(roomId) {
   const count = socketsInRoom ? socketsInRoom.size : 0;
 
   if (count === 0) {
-    // sempre limpa mensagens quando fica vazio
     if (messages.has(roomId)) messages.set(roomId, []);
 
-    // remove grupos/dm totalmente
     const r = rooms.get(roomId);
     if (r && (r.type === "group" || r.type === "dm")) {
       rooms.delete(roomId);
@@ -299,13 +295,29 @@ function removeUserMessages(socketId, roomId) {
 }
 
 function buildSeriesFromCircular(windowArr, currentSec) {
-  // retorna em ordem cronológica (60 pontos)
   const out = [];
   for (let i = 59; i >= 0; i--) {
     const sec = currentSec - i;
     out.push(windowArr[sec % 60] || 0);
   }
   return out;
+}
+
+function pushMessage(roomId, msg){
+  const arr = messages.get(roomId) || [];
+  arr.push(msg);
+
+  // limite anti-memória (mantém o "sem persistência" e evita explodir RAM)
+  const MAX = 400;
+  if (arr.length > MAX) arr.splice(0, arr.length - MAX);
+
+  messages.set(roomId, arr);
+}
+
+function safeBase64Size(base64Str){
+  // estimativa grosseira do tamanho real do base64
+  const s = String(base64Str || "");
+  return Math.floor(s.length * 0.75);
 }
 
 // ======================================================
@@ -406,13 +418,11 @@ app.get("/api/admin/metrics", requireAdmin, (req, res) => {
     bootAt: metrics.bootAt,
     uptimeSec: Math.floor(process.uptime()),
 
-    // flags
     flags: {
       groupCreationEnabled: flags.groupCreationEnabled,
       generalFrozen: isRoomFrozen("geral"),
     },
 
-    // online/picos
     onlineNow: users.size,
     peakOnline: metrics.peakOnline,
     peakOnlineAt: metrics.peakOnlineAt,
@@ -421,30 +431,25 @@ app.get("/api/admin/metrics", requireAdmin, (req, res) => {
     groupsTotal: Array.from(rooms.values()).filter(x => x.type === "group").length,
     dmActive: Array.from(rooms.values()).filter(x => x.type === "dm").length,
 
-    // sessões
     avgSessionNowMs: getAvgSessionNowMs(),
     avgSessionAllMs: getAvgSessionAllMs(),
     sessionsClosedCount: metrics.sessionsClosedCount,
 
-    // msgs/min
     msgsPerMinNow: getMsgsPerMinNow(),
     peakMsgsPerMin: metrics.peakMsgsPerMin,
     peakMsgsPerMinAt: metrics.peakMsgsPerMinAt,
 
-    // séries (60 pontos)
     series: {
       onlineLast60: buildSeriesFromCircular(metrics.onlineWindow, nowSec),
       msgsLast60: buildSeriesFromCircular(metrics.msgWindow, nowSec),
     },
 
-    // RAM
     ram,
-
     byRoom
   });
 });
 
-// detalhes de uma sala (clicar na tabela)
+// detalhes de uma sala
 app.get("/api/admin/room/:id", requireAdmin, (req, res) => {
   const id = req.params.id;
   const r = rooms.get(id);
@@ -499,7 +504,7 @@ app.post("/api/admin/room/:id/freeze", requireAdmin, (req, res) => {
   res.json({ ok: true, roomId: id, frozen: isRoomFrozen(id) });
 });
 
-// excluir grupo (desconecta usuários do grupo e remove tudo)
+// excluir grupo
 app.delete("/api/admin/room/:id", requireAdmin, async (req, res) => {
   const id = req.params.id;
   const r = rooms.get(id);
@@ -554,12 +559,37 @@ app.post("/api/admin/ban-ip", requireAdmin, (req, res) => {
 
   const ip = users.get(socketId)?.ip || getIp(s.request);
   const until = minutes > 0 ? (Date.now() + minutes * 60 * 1000) : null;
-  bansByIp.set(ip, { until, reason });
+  bansByIp.set(ip, { until, reason, createdAt: Date.now() });
 
   io.to(socketId).emit("admin_ban", { message: reason });
   setTimeout(() => { try { s.disconnect(true); } catch {} }, 120);
 
   res.json({ ok: true, ip, until });
+});
+
+// LISTA DE BANS (para Admin)
+app.get("/api/admin/bans", requireAdmin, (req, res) => {
+  const out = [];
+  for (const [ip, b] of bansByIp.entries()) {
+    const active = !b.until || Date.now() <= b.until;
+    out.push({
+      ip,
+      active,
+      createdAt: b.createdAt || null,
+      until: b.until || null,
+      reason: b.reason || ""
+    });
+  }
+  out.sort((a,b) => (b.createdAt||0) - (a.createdAt||0));
+  res.json({ ok: true, bans: out });
+});
+
+// DESBANIR
+app.post("/api/admin/unban", requireAdmin, (req, res) => {
+  const ip = String(req.body?.ip || "").trim();
+  if(!ip) return res.status(400).json({ ok:false, error:"IP é obrigatório." });
+  bansByIp.delete(ip);
+  res.json({ ok:true });
 });
 
 // Se bater em /api e não existir rota, NUNCA devolve HTML:
@@ -640,12 +670,13 @@ io.on("connection", (socket) => {
     emitUsers(roomId);
   });
 
-  socket.on("send_message", ({ type, content, roomId, replyTo }) => {
+  // ========= ENVIO DE MENSAGEM (CORRIGIDO COMPLETO) =========
+  socket.on("send_message", ({ type, content, replyTo }) => {
     const u = users.get(socket.id);
     if (!u) return;
 
     const rid = u.roomId;
-    if (roomId && roomId !== rid) return;
+    if (!rid) return;
 
     if (isRoomFrozen(rid)) {
       return socket.emit("error_toast", { message: "Esta sala está congelada pelo administrador." });
@@ -658,191 +689,188 @@ io.on("connection", (socket) => {
     const c = String(content || "");
     if (!c) return;
 
-        if (t === "text" && c.length > 2000) {
-      return socket.emit("error_toast", { message: "Texto muito grande (máx 2000 caracteres)." });
+    // validações por tipo
+    if (t === "text") {
+      const trimmed = c.trim();
+      if (!trimmed) return;
+      if (trimmed.length > 1200) return socket.emit("error_toast", { message: "Mensagem muito longa." });
+
+      const msg = {
+        id: "m_" + nanoid(12),
+        userId: socket.id,
+        nick: u.nick,
+        roomId: rid,
+        type: "text",
+        content: trimmed,
+        ts: Date.now(),
+        replyTo: replyTo && replyTo.id ? {
+          id: String(replyTo.id),
+          userNick: String(replyTo.userNick || ""),
+          preview: String(replyTo.preview || "").slice(0, 160),
+        } : null,
+        reactions: {}
+      };
+
+      ensureRoom(rid);
+      pushMessage(rid, msg);
+      bumpMsgCounter();
+      io.to(rid).emit("message_new", { message: msg });
+      return;
     }
-    if (t !== "text" && c.length > 5_500_000) {
-      return socket.emit("error_toast", { message: "Arquivo muito grande." });
+
+    if (t === "image") {
+      // content base64 data url
+      if (!c.startsWith("data:image/")) return socket.emit("error_toast", { message: "Imagem inválida." });
+      const est = safeBase64Size(c);
+      if (est > 5 * 1024 * 1024) return socket.emit("error_toast", { message: "Imagem muito grande." });
+
+      const msg = {
+        id: "m_" + nanoid(12),
+        userId: socket.id,
+        nick: u.nick,
+        roomId: rid,
+        type: "image",
+        content: c,
+        ts: Date.now(),
+        replyTo: replyTo && replyTo.id ? {
+          id: String(replyTo.id),
+          userNick: String(replyTo.userNick || ""),
+          preview: String(replyTo.preview || "").slice(0, 160),
+        } : null,
+        reactions: {}
+      };
+
+      ensureRoom(rid);
+      pushMessage(rid, msg);
+      bumpMsgCounter();
+      io.to(rid).emit("message_new", { message: msg });
+      return;
     }
 
-    const msg = {
-      id: "m_" + nanoid(10),
-      roomId: rid,
-      userId: socket.id,
-      nick: u.nick,
-      type: t,
-      content: c,
-      ts: Date.now(),
-      reactions: {},
-      replyTo: replyTo && replyTo.id ? {
-        id: String(replyTo.id),
-        nick: String(replyTo.nick || "").slice(0, 18),
-        preview: String(replyTo.preview || "").slice(0, 140),
-        type: String(replyTo.type || "text")
-      } : null,
-    };
+    if (t === "audio") {
+      if (!c.startsWith("data:audio/") && !c.startsWith("data:audio")) {
+        return socket.emit("error_toast", { message: "Áudio inválido." });
+      }
+      const est = safeBase64Size(c);
+      if (est > 5 * 1024 * 1024) return socket.emit("error_toast", { message: "Áudio muito grande." });
 
-    const arr = messages.get(rid) || [];
-    arr.push(msg);
-    while (arr.length > 250) arr.shift();
-    messages.set(rid, arr);
+      const msg = {
+        id: "m_" + nanoid(12),
+        userId: socket.id,
+        nick: u.nick,
+        roomId: rid,
+        type: "audio",
+        content: c,
+        ts: Date.now(),
+        replyTo: replyTo && replyTo.id ? {
+          id: String(replyTo.id),
+          userNick: String(replyTo.userNick || ""),
+          preview: String(replyTo.preview || "").slice(0, 160),
+        } : null,
+        reactions: {}
+      };
 
-    bumpMsgCounter();
-    io.to(rid).emit("new_message", msg);
+      ensureRoom(rid);
+      pushMessage(rid, msg);
+      bumpMsgCounter();
+      io.to(rid).emit("message_new", { message: msg });
+      return;
+    }
   });
 
-  socket.on("react_message", ({ roomId, messageId, emoji }) => {
+  // ========= REAÇÕES =========
+  socket.on("react_message", ({ messageId, emoji }) => {
     const u = users.get(socket.id);
     if (!u) return;
-
     const rid = u.roomId;
-    if (roomId && roomId !== rid) return;
 
-    emoji = String(emoji || "").trim().slice(0, 8);
-    if (!emoji) return;
+    const em = String(emoji || "").trim();
+    if (!em || em.length > 6) return;
 
     const arr = messages.get(rid) || [];
-    const m = arr.find(x => x.id === messageId);
-    if (!m) return;
+    const idx = arr.findIndex(m => m.id === messageId);
+    if (idx < 0) return;
 
-    // toggle simples: se o usuário reagir no mesmo emoji de novo, remove 1
-    // (não guardamos quem reagiu para simplificar sem persistência; então é só contador)
-    m.reactions[emoji] = (m.reactions[emoji] || 0) + 1;
+    const msg = arr[idx];
+    if (!msg.reactions) msg.reactions = {};
+    msg.reactions[em] = (msg.reactions[em] || 0) + 1;
 
-    io.to(rid).emit("message_reacted", { messageId: m.id, reactions: m.reactions });
+    arr[idx] = msg;
+    messages.set(rid, arr);
+    io.to(rid).emit("message_reaction", { id: msg.id, reactions: msg.reactions });
   });
 
-  // ======================================================
-  // DM (mensagem privada) — ainda sem persistência
-  // ======================================================
-  socket.on("start_dm", ({ peerSocketId }) => {
-    const me = users.get(socket.id);
-    if (!me) return;
+  // ========= DM (mensagem privada) =========
+  socket.on("send_dm", ({ to, content }) => {
+    const fromU = users.get(socket.id);
+    if (!fromU) return;
 
-    const peer = users.get(peerSocketId);
-    if (!peer) return socket.emit("error_toast", { message: "Usuário não está mais online." });
+    const toId = String(to || "");
+    const s2 = io.sockets.sockets.get(toId);
+    const toU = users.get(toId);
 
-    // DM só entre pessoas na mesma sala atual
-    if (peer.roomId !== me.roomId) {
-      return socket.emit("error_toast", { message: "Usuário não está nessa mesma sala." });
-    }
+    if (!s2 || !toU) return socket.emit("error_toast", { message: "Usuário não encontrado para DM." });
 
-    const dmId = dmIdFor(socket.id, peerSocketId);
+    const msgTxt = String(content || "").trim();
+    if (!msgTxt) return;
+    if (msgTxt.length > 900) return socket.emit("error_toast", { message: "DM muito longa." });
+
+    const dmId = dmIdFor(socket.id, toId);
     ensureDm(dmId);
 
-    socket.join(dmId);
-    io.to(peerSocketId).socketsJoin(dmId);
-
-    socket.emit("dm_ready", { dmId, peer: { socketId: peerSocketId, nick: peer.nick } });
-    io.to(peerSocketId).emit("dm_ready", { dmId, peer: { socketId: socket.id, nick: me.nick } });
-
-    socket.emit("dm_snapshot", { dmId, messages: messages.get(dmId) || [] });
-    io.to(peerSocketId).emit("dm_snapshot", { dmId, messages: messages.get(dmId) || [] });
-  });
-
-  socket.on("send_dm", ({ dmId, type, content, replyTo }) => {
-    const me = users.get(socket.id);
-    if (!me) return;
-
-    const r = rooms.get(dmId);
-    if (!r || r.type !== "dm") return;
-
-    // opcional: congelar DM? (não fazemos por padrão)
-    // if (isRoomFrozen(dmId)) return socket.emit("error_toast", { message: "Este privado está congelado." });
-
-    const t = String(type || "text");
-    const allowed = new Set(["text", "image", "audio"]);
-    if (!allowed.has(t)) return;
-
-    const c = String(content || "");
-    if (!c) return;
-
-    if (t === "text" && c.length > 2000) {
-      return socket.emit("error_toast", { message: "Texto muito grande (máx 2000)." });
-    }
-    if (t !== "text" && c.length > 5_500_000) {
-      return socket.emit("error_toast", { message: "Arquivo muito grande." });
-    }
-
     const msg = {
-      id: "m_" + nanoid(10),
-      roomId: dmId,
+      id: "m_" + nanoid(12),
       userId: socket.id,
-      nick: me.nick,
-      type: t,
-      content: c,
+      nick: fromU.nick,
+      roomId: dmId,
+      type: "text",
+      content: msgTxt,
       ts: Date.now(),
-      reactions: {},
-      replyTo: replyTo && replyTo.id ? {
-        id: String(replyTo.id),
-        nick: String(replyTo.nick || "").slice(0, 18),
-        preview: String(replyTo.preview || "").slice(0, 140),
-        type: String(replyTo.type || "text")
-      } : null
+      replyTo: null,
+      reactions: {}
     };
 
-    const arr = messages.get(dmId) || [];
-    arr.push(msg);
-    while (arr.length > 200) arr.shift();
-    messages.set(dmId, arr);
-
+    pushMessage(dmId, msg);
     bumpMsgCounter();
-    io.to(dmId).emit("dm_new_message", { dmId, message: msg });
+
+    // entra ambos na sala dm
+    socket.join(dmId);
+    s2.join(dmId);
+
+    // manda snapshot pequeno? (mantém leve)
+    io.to(dmId).emit("message_new", { message: msg });
   });
 
-  socket.on("react_dm", ({ dmId, messageId, emoji }) => {
-    const r = rooms.get(dmId);
-    if (!r || r.type !== "dm") return;
-
-    emoji = String(emoji || "").trim().slice(0, 8);
-    if (!emoji) return;
-
-    const arr = messages.get(dmId) || [];
-    const m = arr.find(x => x.id === messageId);
-    if (!m) return;
-
-    m.reactions[emoji] = (m.reactions[emoji] || 0) + 1;
-    io.to(dmId).emit("dm_reacted", { dmId, messageId: m.id, reactions: m.reactions });
-  });
-
-  // ======================================================
-  // DISCONNECT
-  // ======================================================
   socket.on("disconnect", () => {
     const u = users.get(socket.id);
     if (!u) return;
 
-    // sessões encerradas
+    // sessão encerrada
     if (u.connectedAt) {
-      const dur = Math.max(0, Date.now() - u.connectedAt);
       metrics.sessionsClosedCount += 1;
-      metrics.sessionsClosedTotalMs += dur;
+      metrics.sessionsClosedTotalMs += Math.max(0, Date.now() - u.connectedAt);
     }
 
-    const { nick, roomId } = u;
     users.delete(socket.id);
 
-    // remove mensagens do usuário do chat público/grupo
-    removeUserMessages(socket.id, roomId);
+    // presença + atualiza lista
+    if (u.roomId) {
+      io.to(u.roomId).emit("presence", { type: "leave", nick: u.nick });
+      emitUsers(u.roomId);
 
-    io.to(roomId).emit("presence", { type: "leave", nick });
-    emitUsers(roomId);
+      // remove mensagens do usuário e limpa sala se vazio (mantém o "não salva")
+      removeUserMessages(socket.id, u.roomId);
+      cleanupRoomIfEmpty(u.roomId);
+    }
 
     updatePeaksOnline();
-
-    // limpa salas vazias
-    setTimeout(() => cleanupRoomIfEmpty(roomId), 60);
-
-    // limpa DMs órfãs
-    for (const [rid, info] of rooms.entries()) {
-      if (info?.type === "dm") setTimeout(() => cleanupRoomIfEmpty(rid), 120);
-    }
   });
 });
 
 // ======================================================
 // START
 // ======================================================
-const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => console.log("Server on port", PORT));
-
+const PORT = process.env.PORT || 4100;
+server.listen(PORT, () => {
+  console.log("Servidor no ar na porta", PORT);
+});

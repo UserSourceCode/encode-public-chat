@@ -1,8 +1,12 @@
+// frontend/src/pages/Admin.jsx
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import Modal from "../ui/Modal.jsx";
 import Toast from "../ui/Toast.jsx";
 
+/* =========================
+   Utils
+========================= */
 function fmtTime(ts){
   if(!ts) return "—";
   return new Date(ts).toLocaleString("pt-BR", {
@@ -11,6 +15,7 @@ function fmtTime(ts){
   });
 }
 function fmtSince(ts){
+  if(!ts) return "—";
   const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
   const h = Math.floor(s/3600);
   const m = Math.floor((s%3600)/60);
@@ -18,7 +23,7 @@ function fmtSince(ts){
   return h>0 ? `${h}h ${m}m` : `${m}m ${ss}s`;
 }
 function fmtDur(ms){
-  const s = Math.max(0, Math.floor(ms/1000));
+  const s = Math.max(0, Math.floor((ms||0)/1000));
   const h = Math.floor(s/3600);
   const m = Math.floor((s%3600)/60);
   const ss = s%60;
@@ -36,7 +41,137 @@ function fmtBytes(b){
   const gb = mb / 1024;
   return `${gb.toFixed(2)} GB`;
 }
+function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
 
+function normalizeSeries(arr){
+  const a = Array.isArray(arr) ? arr.map(x => Number(x || 0)) : [];
+  if(a.length === 0) return new Array(60).fill(0);
+  if(a.length >= 60) return a.slice(-60);
+  const pad = new Array(60 - a.length).fill(0);
+  return [...pad, ...a];
+}
+
+function buildPath(series, w=520, h=150, pad=12){
+  const s = normalizeSeries(series);
+  const max = Math.max(1, ...s);
+  const min = Math.min(...s);
+  const span = Math.max(1, max - min);
+
+  const innerW = w - pad*2;
+  const innerH = h - pad*2;
+
+  const pts = s.map((v, i) => {
+    const x = pad + (i/(s.length-1)) * innerW;
+    const y = pad + (1 - ((v - min) / span)) * innerH;
+    return {x, y, v};
+  });
+
+  let d = `M ${pts[0].x.toFixed(2)} ${pts[0].y.toFixed(2)}`;
+  for(let i=1;i<pts.length;i++){
+    d += ` L ${pts[i].x.toFixed(2)} ${pts[i].y.toFixed(2)}`;
+  }
+  const area = `${d} L ${pts[pts.length-1].x.toFixed(2)} ${(h-pad).toFixed(2)} L ${pts[0].x.toFixed(2)} ${(h-pad).toFixed(2)} Z`;
+  return { d, area, max, min, last: pts[pts.length-1]?.v ?? 0 };
+}
+
+/* =========================
+   Mini Charts (SVG)
+========================= */
+function LineGlowChart({ title, subtitle, series, height=160 }){
+  const w = 560;
+  const h = height;
+  const safeId = useMemo(()=>String(title||"chart").replace(/[^\w]+/g,"_"), [title]);
+  const { d, area, max, last } = useMemo(()=>buildPath(series, w, h, 14), [series, w, h]);
+
+  return (
+    <div className="chart-card">
+      <div className="chart-head">
+        <div>
+          <div className="chart-title">{title}</div>
+          <div className="muted">{subtitle}</div>
+        </div>
+        <div className="chart-meta">
+          <span className="badge good">Agora: <b>{last}</b></span>
+          <span className="badge warn">Pico: <b>{max}</b></span>
+        </div>
+      </div>
+
+      <div className="chart-wrap">
+        <svg width="100%" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
+          <defs>
+            <linearGradient id={`gArea_${safeId}`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="rgba(45,108,223,.35)"/>
+              <stop offset="100%" stopColor="rgba(45,108,223,0)"/>
+            </linearGradient>
+            <filter id={`softGlow_${safeId}`} x="-30%" y="-30%" width="160%" height="160%">
+              <feGaussianBlur stdDeviation="3" result="blur"/>
+              <feMerge>
+                <feMergeNode in="blur"/>
+                <feMergeNode in="SourceGraphic"/>
+              </feMerge>
+            </filter>
+          </defs>
+
+          <path d={area} fill={`url(#gArea_${safeId})`} />
+          <path d={d} fill="none" stroke="rgba(45,108,223,.95)" strokeWidth="2.6" filter={`url(#softGlow_${safeId})`} />
+        </svg>
+      </div>
+    </div>
+  );
+}
+
+function PieCard({ title, subtitle, items }){
+  const total = items.reduce((a,b)=>a+Number(b.value||0), 0) || 1;
+  const segs = items
+    .map(x => ({ ...x, value: Number(x.value||0) }))
+    .filter(x => x.value > 0);
+
+  const stops = [];
+  let acc = 0;
+  for(const it of segs){
+    const p = (it.value / total) * 100;
+    const from = acc;
+    const to = acc + p;
+    const hue = (Math.floor(from * 3.6) + 210) % 360;
+    stops.push({ from, to, color: `hsla(${hue}, 85%, 60%, .92)` });
+    acc = to;
+  }
+
+  const conic = stops.length
+    ? `conic-gradient(${stops.map(s => `${s.color} ${s.from}% ${s.to}%`).join(",")})`
+    : `conic-gradient(rgba(255,255,255,.12) 0% 100%)`;
+
+  return (
+    <div className="chart-card">
+      <div className="chart-head">
+        <div>
+          <div className="chart-title">{title}</div>
+          <div className="muted">{subtitle}</div>
+        </div>
+        <div className="chart-meta">
+          <span className="badge mono">Total: <b>{total}</b></span>
+        </div>
+      </div>
+
+      <div className="pie-row">
+        <div className="pie" style={{ backgroundImage: conic }} />
+        <div className="pie-legend">
+          {items.map((it, idx)=>(
+            <div key={idx} className="legend-row">
+              <div className="legend-dot" />
+              <div className="legend-label">{it.label}</div>
+              <div className="legend-val"><b>{it.value}</b></div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* =========================
+   Main Admin
+========================= */
 export default function Admin(){
   const nav = useNavigate();
 
@@ -50,8 +185,9 @@ export default function Admin(){
   const [metrics, setMetrics] = useState(null);
   const [loading, setLoading] = useState(false);
 
-  // tabs do admin
-  const [tab, setTab] = useState("visao"); // visao | salas | moderacao | ram
+  // tabs
+  const [tab, setTab] = useState("visao"); // visao | salas | moderacao | bans | ram
+  const [filter, setFilter] = useState("");
 
   // modal sala
   const [openRoom, setOpenRoom] = useState(false);
@@ -60,10 +196,15 @@ export default function Admin(){
 
   // moderação (actions)
   const [actionModal, setActionModal] = useState(false);
-  const [actionTarget, setActionTarget] = useState(null); // {socketId,nick}
+  const [actionTarget, setActionTarget] = useState(null); // {socketId,nick,connectedAt}
   const [actionType, setActionType] = useState("warn"); // warn|kick|ban
   const [actionMsg, setActionMsg] = useState("");
   const [banMinutes, setBanMinutes] = useState(60);
+
+  // bans list (feature-detect)
+  const [bans, setBans] = useState([]);
+  const [bansSupported, setBansSupported] = useState(true);
+  const [bansLoading, setBansLoading] = useState(false);
 
   const isAuthed = useMemo(()=>{
     if(!token) return false;
@@ -141,6 +282,38 @@ export default function Admin(){
     }
   }
 
+  async function loadBans(){
+    if(!isAuthed) return;
+    setBansLoading(true);
+    try{
+      const j = await api("/api/admin/bans"); // se existir no backend
+      setBans(Array.isArray(j?.bans) ? j.bans : []);
+      setBansSupported(true);
+    }catch(e){
+      const msg = String(e.message || "");
+      if(msg.includes("404") || msg.toLowerCase().includes("rota")){
+        setBansSupported(false);
+      }else{
+        setToast(e.message || "Falha ao carregar bans.");
+      }
+    }finally{
+      setBansLoading(false);
+    }
+  }
+
+  async function unban(ip){
+    if(!ip) return;
+    const ok = window.confirm(`Desbanir IP ${ip}?`);
+    if(!ok) return;
+    try{
+      await api("/api/admin/unban", { method:"POST", body: JSON.stringify({ ip }) });
+      setToast("IP desbanido.");
+      loadBans();
+    }catch(e){
+      setToast(e.message || "Falha ao desbanir.");
+    }
+  }
+
   useEffect(()=>{
     if(!isAuthed){
       setOpenLogin(true);
@@ -152,9 +325,15 @@ export default function Admin(){
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAuthed]);
 
+  useEffect(()=>{
+    if(tab === "bans"){
+      loadBans();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
+
   async function openRoomDetails(id){
-    if(!id) return;
-    if(!isAuthed) return;
+    if(!id || !isAuthed) return;
 
     setOpenRoom(true);
     setRoomLoading(true);
@@ -172,10 +351,7 @@ export default function Admin(){
 
   async function setFlags(partial){
     try{
-      const j = await api("/api/admin/flags", {
-        method:"POST",
-        body: JSON.stringify(partial)
-      });
+      const j = await api("/api/admin/flags", { method:"POST", body: JSON.stringify(partial) });
       setToast("Configuração atualizada.");
       setMetrics(prev => prev ? ({ ...prev, flags: { ...prev.flags, ...j.flags } }) : prev);
       loadMetrics();
@@ -219,9 +395,11 @@ export default function Admin(){
   function openAction(type, user){
     setActionType(type);
     setActionTarget(user);
-    setActionMsg(type === "warn" ? "Por favor, mantenha o respeito e siga as regras." :
-                 type === "kick" ? "Você foi removido pelo administrador." :
-                 "Acesso bloqueado pelo administrador.");
+    setActionMsg(
+      type === "warn" ? "Por favor, mantenha o respeito e siga as regras." :
+      type === "kick" ? "Você foi removido pelo administrador." :
+      "Acesso bloqueado pelo administrador."
+    );
     setBanMinutes(60);
     setActionModal(true);
   }
@@ -234,19 +412,13 @@ export default function Admin(){
       if(actionType === "warn"){
         await api("/api/admin/warn", {
           method:"POST",
-          body: JSON.stringify({
-            socketId: actionTarget.socketId,
-            message: actionMsg
-          })
+          body: JSON.stringify({ socketId: actionTarget.socketId, message: actionMsg })
         });
         setToast("Aviso enviado.");
       }else if(actionType === "kick"){
         await api("/api/admin/kick", {
           method:"POST",
-          body: JSON.stringify({
-            socketId: actionTarget.socketId,
-            message: actionMsg
-          })
+          body: JSON.stringify({ socketId: actionTarget.socketId, message: actionMsg })
         });
         setToast("Usuário removido.");
       }else{
@@ -262,17 +434,55 @@ export default function Admin(){
       }
       setActionModal(false);
       loadMetrics();
-      if(roomDetail?.id){
-        // recarrega detalhes se modal estava aberto (para atualizar lista)
-        openRoomDetails(roomDetail.id);
-      }
+      if(roomDetail?.id) openRoomDetails(roomDetail.id);
     }catch(e2){
       setToast(e2.message || "Falha na ação.");
     }
   }
 
-  const ram = metrics?.ram || {};
+  /* =========================
+     Derived
+  ========================= */
   const uptimeSec = metrics?.uptimeSec || 0;
+  const ram = metrics?.ram || {};
+  const seriesOnline = metrics?.series?.onlineLast60 || [];
+  const seriesMsgs = metrics?.series?.msgsLast60 || [];
+
+  const byRoom = Array.isArray(metrics?.byRoom) ? metrics.byRoom : [];
+
+  const filteredRooms = useMemo(()=>{
+    const f = String(filter || "").trim().toLowerCase();
+    if(!f) return byRoom;
+    return byRoom.filter(r => {
+      const hay = `${r.name} ${r.id} ${r.type}`.toLowerCase();
+      return hay.includes(f);
+    });
+  }, [byRoom, filter]);
+
+  const roomsSummary = useMemo(()=>{
+    const pub = byRoom.filter(r=>r.type==="public").length;
+    const grp = byRoom.filter(r=>r.type==="group").length;
+    const dm = byRoom.filter(r=>r.type==="dm").length;
+    return { pub, grp, dm };
+  }, [byRoom]);
+
+  const onlineDistribution = useMemo(()=>{
+    const pub = byRoom.filter(r=>r.type==="public").reduce((a,b)=>a+(b.onlineNow||0),0);
+    const grp = byRoom.filter(r=>r.type==="group").reduce((a,b)=>a+(b.onlineNow||0),0);
+    const dm = byRoom.filter(r=>r.type==="dm").reduce((a,b)=>a+(b.onlineNow||0),0);
+    return [
+      { label: "Geral/Públicas", value: pub },
+      { label: "Grupos", value: grp },
+      { label: "Privados (DM)", value: dm },
+    ];
+  }, [byRoom]);
+
+  const topRooms = useMemo(()=>{
+    return [...byRoom]
+      .sort((a,b)=> (b.onlineNow - a.onlineNow) || (b.messagesCount - a.messagesCount))
+      .slice(0, 6)
+      .map(r => ({ label: r.name.length>14 ? r.name.slice(0,14)+"…" : r.name, value: r.onlineNow||0 }));
+  }, [byRoom]);
 
   return (
     <div className="shell">
@@ -307,7 +517,7 @@ export default function Admin(){
           </div>
           <div className="admin-tools">
             <span className="badge mono">Sessão: {exp ? fmtTime(exp) : "—"}</span>
-            <span className="badge">Online: <b>{metrics?.onlineNow ?? "—"}</b></span>
+            <span className="badge good">Online: <b>{metrics?.onlineNow ?? "—"}</b></span>
           </div>
         </div>
 
@@ -316,124 +526,154 @@ export default function Admin(){
           <button className={"tab " + (tab==="visao" ? "active" : "")} onClick={()=>setTab("visao")}>Visão geral</button>
           <button className={"tab " + (tab==="salas" ? "active" : "")} onClick={()=>setTab("salas")}>Salas</button>
           <button className={"tab " + (tab==="moderacao" ? "active" : "")} onClick={()=>setTab("moderacao")}>Moderação</button>
+          <button className={"tab " + (tab==="bans" ? "active" : "")} onClick={()=>setTab("bans")}>Bloqueios</button>
           <button className={"tab " + (tab==="ram" ? "active" : "")} onClick={()=>setTab("ram")}>RAM</button>
         </div>
 
         {/* VISÃO GERAL */}
         {tab === "visao" && (
-          <div className="admin-grid">
-            <div className="admin-card">
-              <h2>Online agora</h2>
-              <div className="admin-badges">
-                <span className="badge good">Online: <b>{metrics?.onlineNow ?? "—"}</b></span>
-                <span className="badge">Salas: <b>{metrics?.roomsTotal ?? "—"}</b></span>
-                <span className="badge">Grupos: <b>{metrics?.groupsTotal ?? "—"}</b></span>
-                <span className="badge">DMs ativos: <b>{metrics?.dmActive ?? "—"}</b></span>
-              </div>
-              <div className="muted" style={{ marginTop: 10 }}>
-                Contagem do servidor atual (1 instância). Sem persistência: reiniciou, zera.
-              </div>
-            </div>
-
-            <div className="admin-card">
-              <h2>Picos</h2>
-              <div className="admin-badges">
-                <span className="badge warn">Pico online: <b>{metrics?.peakOnline ?? "—"}</b></span>
-                <span className="badge mono">Quando: {metrics?.peakOnlineAt ? fmtTime(metrics.peakOnlineAt) : "—"}</span>
-                <span className="badge">Pico (últ. 60s): <b>{metrics?.peakOnlineLast60 ?? "—"}</b></span>
-              </div>
-              <div className="muted" style={{ marginTop: 10 }}>
-                Picos por sala aparecem na aba “Salas”.
-              </div>
-            </div>
-
-            <div className="admin-card">
-              <h2>Tempo médio de sessão</h2>
-              <div className="admin-badges">
-                <span className="badge good">Online agora: <b>{metrics ? fmtDur(metrics.avgSessionNowMs || 0) : "—"}</b></span>
-                <span className="badge">Histórico (boot): <b>{metrics ? fmtDur(metrics.avgSessionAllMs || 0) : "—"}</b></span>
-                <span className="badge mono">Sessões encerradas: <b>{metrics?.sessionsClosedCount ?? "—"}</b></span>
-              </div>
-              <div className="muted" style={{ marginTop: 10 }}>
-                Histórico inclui sessões encerradas + ativas (desde o boot).
-              </div>
-            </div>
-
-            <div className="admin-card">
-              <h2>Mensagens por minuto</h2>
-              <div className="admin-badges">
-                <span className="badge good">Agora (últ. 60s): <b>{metrics?.msgsPerMinNow ?? "—"}</b></span>
-                <span className="badge warn">Pico: <b>{metrics?.peakMsgsPerMin ?? "—"}</b></span>
-                <span className="badge mono">Quando: {metrics?.peakMsgsPerMinAt ? fmtTime(metrics.peakMsgsPerMinAt) : "—"}</span>
-              </div>
-              <div className="muted" style={{ marginTop: 10 }}>
-                Conta mensagens do Geral + Grupos + DMs.
-              </div>
-            </div>
-
-            <div className="admin-card">
-              <h2>Controles</h2>
-              <div className="controls">
-                <div className="control">
-                  <div>
-                    <div className="control-title">Criação de grupos</div>
-                    <div className="muted">{metrics?.flags?.groupCreationEnabled ? "LIBERADA" : "BLOQUEADA"}</div>
-                  </div>
-                  <button
-                    className={"btn " + (metrics?.flags?.groupCreationEnabled ? "danger" : "primary")}
-                    onClick={()=>setFlags({ groupCreationEnabled: !metrics?.flags?.groupCreationEnabled })}
-                  >
-                    {metrics?.flags?.groupCreationEnabled ? "Bloquear" : "Liberar"}
-                  </button>
+          <>
+            <div className="admin-grid">
+              <div className="admin-card">
+                <h2>Online agora</h2>
+                <div className="admin-badges">
+                  <span className="badge good">Online: <b>{metrics?.onlineNow ?? "—"}</b></span>
+                  <span className="badge">Salas: <b>{metrics?.roomsTotal ?? "—"}</b></span>
+                  <span className="badge">Grupos: <b>{metrics?.groupsTotal ?? "—"}</b></span>
+                  <span className="badge">DMs ativos: <b>{metrics?.dmActive ?? "—"}</b></span>
                 </div>
-
-                <div className="control">
-                  <div>
-                    <div className="control-title">Congelar Geral</div>
-                    <div className="muted">{metrics?.flags?.generalFrozen ? "CONGELADO" : "ATIVO"}</div>
-                  </div>
-                  <button
-                    className={"btn " + (metrics?.flags?.generalFrozen ? "primary" : "danger")}
-                    onClick={()=>setFlags({ generalFrozen: !metrics?.flags?.generalFrozen })}
-                  >
-                    {metrics?.flags?.generalFrozen ? "Descongelar" : "Congelar"}
-                  </button>
+                <div className="muted" style={{ marginTop: 10 }}>
+                  Contagem do servidor atual (1 instância). Sem persistência: reiniciou, zera.
                 </div>
               </div>
 
-              <div className="muted" style={{ marginTop: 10 }}>
-                Dica: na aba “Salas”, você congela/descongela qualquer sala individual.
+              <div className="admin-card">
+                <h2>Picos + Sessão</h2>
+                <div className="admin-badges">
+                  <span className="badge warn">Pico online: <b>{metrics?.peakOnline ?? "—"}</b></span>
+                  <span className="badge mono">Quando: {metrics?.peakOnlineAt ? fmtTime(metrics.peakOnlineAt) : "—"}</span>
+                </div>
+                <div className="admin-badges" style={{ marginTop: 10 }}>
+                  <span className="badge good">Sessão média (agora): <b>{metrics ? fmtDur(metrics.avgSessionNowMs || 0) : "—"}</b></span>
+                  <span className="badge">Sessão média (boot): <b>{metrics ? fmtDur(metrics.avgSessionAllMs || 0) : "—"}</b></span>
+                  <span className="badge mono">Encerradas: <b>{metrics?.sessionsClosedCount ?? "—"}</b></span>
+                </div>
+                <div className="muted" style={{ marginTop: 10 }}>
+                  Métricas são em RAM (desde o boot).
+                </div>
+              </div>
+
+              <div className="admin-card">
+                <h2>Controles</h2>
+                <div className="controls">
+                  <div className="control">
+                    <div>
+                      <div className="control-title">Criação de grupos</div>
+                      <div className="muted">{metrics?.flags?.groupCreationEnabled ? "LIBERADA" : "BLOQUEADA"}</div>
+                    </div>
+                    <button
+                      className={"btn " + (metrics?.flags?.groupCreationEnabled ? "danger" : "primary")}
+                      onClick={()=>setFlags({ groupCreationEnabled: !metrics?.flags?.groupCreationEnabled })}
+                    >
+                      {metrics?.flags?.groupCreationEnabled ? "Bloquear" : "Liberar"}
+                    </button>
+                  </div>
+
+                  <div className="control">
+                    <div>
+                      <div className="control-title">Congelar Geral</div>
+                      <div className="muted">{metrics?.flags?.generalFrozen ? "CONGELADO" : "ATIVO"}</div>
+                    </div>
+                    <button
+                      className={"btn " + (metrics?.flags?.generalFrozen ? "primary" : "danger")}
+                      onClick={()=>setFlags({ generalFrozen: !metrics?.flags?.generalFrozen })}
+                    >
+                      {metrics?.flags?.generalFrozen ? "Descongelar" : "Congelar"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="muted" style={{ marginTop: 10 }}>
+                  Dica: na aba “Salas”, você congela/descongela qualquer sala.
+                </div>
+              </div>
+
+              <div className="admin-card">
+                <h2>Mensagens por minuto</h2>
+                <div className="admin-badges">
+                  <span className="badge good">Agora (últ. 60s): <b>{metrics?.msgsPerMinNow ?? "—"}</b></span>
+                  <span className="badge warn">Pico: <b>{metrics?.peakMsgsPerMin ?? "—"}</b></span>
+                  <span className="badge mono">Quando: {metrics?.peakMsgsPerMinAt ? fmtTime(metrics.peakMsgsPerMinAt) : "—"}</span>
+                </div>
+                <div className="muted" style={{ marginTop: 10 }}>
+                  Conta mensagens do Geral + Grupos + DMs.
+                </div>
               </div>
             </div>
 
-            <div className="admin-card">
-              <h2>Dica</h2>
-              <div className="muted">
-                Clique em uma sala na aba “Salas” para abrir detalhes: usuários, tempo ativa, ações rápidas e mais.
-              </div>
+            <div className="admin-grid" style={{ marginTop: 14 }}>
+              <LineGlowChart
+                title="Online (últimos 60s)"
+                subtitle="Curva com picos em tempo real (servidor)"
+                series={seriesOnline}
+              />
+              <LineGlowChart
+                title="Mensagens (últimos 60s)"
+                subtitle="Volume por segundo, somado (Geral + Grupos + DMs)"
+                series={seriesMsgs}
+              />
+              <PieCard
+                title="Distribuição de usuários (agora)"
+                subtitle="Como o online está dividido"
+                items={onlineDistribution}
+              />
+              <PieCard
+                title="Top salas (online agora)"
+                subtitle="As 6 salas com maior presença"
+                items={topRooms.length ? topRooms : [{label:"Sem dados", value:0}]}
+              />
             </div>
-          </div>
+          </>
         )}
 
         {/* SALAS */}
         {tab === "salas" && (
           <div className="admin-card full">
-            <h2>Salas (geral / grupos / dms)</h2>
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap: 12, flexWrap:"wrap" }}>
+              <div>
+                <h2 style={{ marginBottom: 6 }}>Salas (geral / grupos / dms)</h2>
+                <div className="muted">
+                  Tipos: Públicas <b>{roomsSummary.pub}</b> • Grupos <b>{roomsSummary.grp}</b> • DMs <b>{roomsSummary.dm}</b>
+                </div>
+              </div>
 
-            <table className="admin-table clickable-rows">
+              <div style={{ display:"flex", gap: 10, alignItems:"center", flexWrap:"wrap" }}>
+                <input
+                  className="home-input"
+                  style={{ width: 320 }}
+                  value={filter}
+                  onChange={(e)=>setFilter(e.target.value)}
+                  placeholder="Filtrar por nome, id ou tipo…"
+                />
+                <button className="btn" onClick={()=>setFilter("")}>Limpar</button>
+              </div>
+            </div>
+
+            <table className="admin-table clickable-rows" style={{ marginTop: 12 }}>
               <thead>
                 <tr>
                   <th>Tipo</th>
                   <th>Sala</th>
                   <th>ID</th>
                   <th>Online agora</th>
+                  <th>Msgs</th>
                   <th>Pico sala</th>
                   <th>Quando</th>
                   <th>Congelada</th>
                 </tr>
               </thead>
               <tbody>
-                {(metrics?.byRoom || []).map(r => (
+                {filteredRooms.map(r => (
                   <tr key={r.id} onClick={()=>openRoomDetails(r.id)}>
                     <td>
                       <span className={"badge " + (r.type==="group" ? "warn" : r.type==="dm" ? "danger" : "good")}>
@@ -443,19 +683,20 @@ export default function Admin(){
                     <td style={{ fontWeight: 900 }}>{r.name}</td>
                     <td className="mono">{r.id}</td>
                     <td><b>{r.onlineNow}</b></td>
+                    <td>{r.messagesCount}</td>
                     <td>{r.peakOnline}</td>
                     <td className="mono">{r.peakOnlineAt ? fmtTime(r.peakOnlineAt) : "—"}</td>
                     <td>{r.frozen ? "Sim" : "Não"}</td>
                   </tr>
                 ))}
-                {(!metrics?.byRoom || metrics.byRoom.length===0) && (
-                  <tr><td colSpan="7" className="muted">Sem dados ainda.</td></tr>
+                {filteredRooms.length === 0 && (
+                  <tr><td colSpan="8" className="muted">Nenhuma sala encontrada.</td></tr>
                 )}
               </tbody>
             </table>
 
             <div className="muted" style={{ marginTop: 10 }}>
-              Clique em uma linha para abrir detalhes da sala.
+              Clique em uma sala para abrir detalhes (tempo ativa, usuários, ações).
             </div>
           </div>
         )}
@@ -464,43 +705,89 @@ export default function Admin(){
         {tab === "moderacao" && (
           <div className="admin-grid">
             <div className="admin-card">
-              <h2>Usuários online (global)</h2>
-              <div className="muted" style={{ marginBottom: 10 }}>
-                Selecione uma sala na aba “Salas” para ver usuários por sala. Aqui é uma visão rápida.
+              <h2>Fluxo de moderação</h2>
+              <div className="muted">
+                1) Vá em <b>Salas</b> • 2) Clique na sala • 3) No modal, use <b>Avisar/Kick/Ban IP</b>.
               </div>
-
-              <table className="admin-table">
-                <thead>
-                  <tr>
-                    <th>Apelido</th>
-                    <th>Sala</th>
-                    <th>Ações</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(() => {
-                    // monta lista rápida a partir de byRoom (apenas contagem) não tem nicks.
-                    // então mostramos instrução e levamos o admin para clicar na sala.
-                    return (
-                      <tr>
-                        <td colSpan="3" className="muted">
-                          Para moderar usuários (avisar/kick/ban), clique em uma sala na aba “Salas”
-                          e use o modal de detalhes (lá tem a lista completa com botões).
-                        </td>
-                      </tr>
-                    );
-                  })()}
-                </tbody>
-              </table>
+              <div className="muted" style={{ marginTop: 10 }}>
+                Dica: “Congelar” bloqueia envio (Geral/Grupo/DM). “Excluir grupo” derruba o grupo inteiro.
+              </div>
             </div>
 
             <div className="admin-card">
-              <h2>Bloqueios (IP)</h2>
-              <div className="muted">
-                IP banido impede o mesmo usuário de voltar (mesmo trocando apelido).<br/>
-                A lista detalhada de bans pode ser adicionada no próximo passo.
+              <h2>Atalhos</h2>
+              <div className="controls">
+                <div className="control">
+                  <div>
+                    <div className="control-title">Abrir salas</div>
+                    <div className="muted">Gerencie salas e usuários</div>
+                  </div>
+                  <button className="btn primary" onClick={()=>setTab("salas")}>Ir para Salas</button>
+                </div>
+
+                <div className="control">
+                  <div>
+                    <div className="control-title">Bloqueios (IP)</div>
+                    <div className="muted">Ver e desbanir</div>
+                  </div>
+                  <button className="btn" onClick={()=>setTab("bans")}>Ir para Bloqueios</button>
+                </div>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* BANS */}
+        {tab === "bans" && (
+          <div className="admin-card full">
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap: 12, flexWrap:"wrap" }}>
+              <div>
+                <h2 style={{ marginBottom: 6 }}>Bloqueios (IP)</h2>
+                <div className="muted">Lista e desbanimento (quando suportado pelo backend).</div>
+              </div>
+
+              <div style={{ display:"flex", gap: 10 }}>
+                <button className="btn" onClick={loadBans} disabled={!bansSupported || bansLoading}>
+                  {bansLoading ? "Carregando..." : "Atualizar"}
+                </button>
+              </div>
+            </div>
+
+            {!bansSupported && (
+              <div className="muted" style={{ marginTop: 12 }}>
+                Sua API ainda não expõe <span className="pill mono">/api/admin/bans</span> e
+                <span className="pill mono"> /api/admin/unban</span>.
+                Quando você quiser, eu te passo o backend desses endpoints.
+              </div>
+            )}
+
+            {bansSupported && (
+              <table className="admin-table" style={{ marginTop: 12 }}>
+                <thead>
+                  <tr>
+                    <th>IP</th>
+                    <th>Até</th>
+                    <th>Motivo</th>
+                    <th>Ação</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {bans.map((b, idx)=>(
+                    <tr key={idx}>
+                      <td className="mono">{b.ip || "—"}</td>
+                      <td className="mono">{b.until ? fmtTime(b.until) : "Permanente"}</td>
+                      <td>{b.reason || "—"}</td>
+                      <td>
+                        <button className="btn" onClick={()=>unban(b.ip)}>Desbanir</button>
+                      </td>
+                    </tr>
+                  ))}
+                  {bans.length === 0 && (
+                    <tr><td colSpan="4" className="muted">Nenhum ban ativo.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            )}
           </div>
         )}
 
@@ -520,11 +807,21 @@ export default function Admin(){
               </div>
             </div>
 
+            <PieCard
+              title="RAM (proporção)"
+              subtitle="Heap usado vs heap livre + External"
+              items={[
+                { label: "Heap usado", value: ram.heapUsed || 0 },
+                { label: "Heap livre", value: Math.max(0, (ram.heapTotal||0) - (ram.heapUsed||0)) },
+                { label: "External", value: ram.external || 0 },
+              ]}
+            />
+
             <div className="admin-card">
               <h2>Observação</h2>
               <div className="muted">
-                Como o projeto é sem persistência, o consumo sobe conforme mensagens/imagens/áudios
-                e depois cai quando salas ficam vazias e são limpas.
+                Como não há banco, o consumo cresce conforme mensagens/imagens/áudios,
+                e cai quando salas ficam vazias e são limpas.
               </div>
             </div>
           </div>
@@ -562,23 +859,25 @@ export default function Admin(){
         {!roomLoading && roomDetail && (
           <div className="room-detail">
             <div className="admin-badges">
-              <span className="badge">{roomDetail.type==="public" ? "Pública" : roomDetail.type==="group" ? "Grupo" : "DM"}</span>
+              <span className="badge">
+                {roomDetail.type==="public" ? "Pública" : roomDetail.type==="group" ? "Grupo" : "DM"}
+              </span>
               <span className="badge mono">ID: <b>{roomDetail.id}</b></span>
-              <span className="badge">Online: <b>{roomDetail.onlineNow}</b></span>
+              <span className="badge good">Online: <b>{roomDetail.onlineNow}</b></span>
               <span className="badge">Mensagens: <b>{roomDetail.messagesCount}</b></span>
               <span className={"badge " + (roomDetail.frozen ? "warn" : "good")}>
                 {roomDetail.frozen ? "CONGELADA" : "ATIVA"}
               </span>
             </div>
 
-            <div className="muted">
+            <div className="muted" style={{ marginTop: 8 }}>
               Criada em: <b style={{ color:"var(--text)" }}>{roomDetail.createdAt ? fmtTime(roomDetail.createdAt) : "—"}</b><br/>
               Ativa há: <b style={{ color:"var(--text)" }}>{roomDetail.activeForMs!=null ? fmtDur(roomDetail.activeForMs) : "—"}</b><br/>
               Última atividade: <b style={{ color:"var(--text)" }}>{roomDetail.lastActivityAt ? fmtTime(roomDetail.lastActivityAt) : "—"}</b><br/>
               Pico: <b style={{ color:"var(--text)" }}>{roomDetail.peak?.peak ?? 0}</b> {roomDetail.peak?.at ? `em ${fmtTime(roomDetail.peak.at)}` : ""}
             </div>
 
-            <div className="row" style={{ justifyContent:"space-between" }}>
+            <div className="row" style={{ justifyContent:"space-between", marginTop: 10 }}>
               <div className="admin-badges">
                 <span className="badge">Nome: <b>{roomDetail.name}</b></span>
               </div>
@@ -599,7 +898,7 @@ export default function Admin(){
               </div>
             </div>
 
-            <div style={{ marginTop: 8 }}>
+            <div style={{ marginTop: 10 }}>
               <div style={{ fontWeight: 1000, marginBottom: 8 }}>Usuários na sala</div>
 
               <div className="users-list">
@@ -660,7 +959,7 @@ export default function Admin(){
                 min="0"
                 max="43200"
                 value={banMinutes}
-                onChange={(e)=>setBanMinutes(e.target.value)}
+                onChange={(e)=>setBanMinutes(clamp(Number(e.target.value||0), 0, 43200))}
               />
             </label>
           )}
@@ -670,23 +969,28 @@ export default function Admin(){
             <textarea
               value={actionMsg}
               onChange={(e)=>setActionMsg(e.target.value)}
+              placeholder="Digite a mensagem…"
               maxLength={220}
-              placeholder="Escreva a mensagem..."
+              rows={4}
               required
             />
+            <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+              {String(actionMsg || "").length}/220
+            </div>
           </label>
 
-          <div className="row">
+          <div className="row" style={{ justifyContent:"flex-end" }}>
             <button type="button" className="btn" onClick={()=>setActionModal(false)}>Cancelar</button>
-            <button className={"btn " + (actionType === "warn" ? "primary" : "danger")} type="submit">
-              Confirmar
+            <button
+              className={"btn " + (actionType === "warn" ? "primary" : "danger")}
+              type="submit"
+            >
+              {actionType === "warn" ? "Enviar aviso" : actionType === "kick" ? "Remover" : "Banir IP"}
             </button>
           </div>
 
           <div className="muted" style={{ marginTop: 8 }}>
-            {actionType === "warn" && "Envia um aviso que aparece no chat do usuário."}
-            {actionType === "kick" && "Remove o usuário e desconecta imediatamente."}
-            {actionType === "ban" && "Bane o IP do usuário (não volta nem mudando o apelido)."}
+            Dica: você pode congelar a sala antes de agir, para parar o fluxo.
           </div>
         </form>
       </Modal>
