@@ -1,0 +1,17 @@
+{
+  "name": "encode-chat-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "express": "^4.19.2",
+    "helmet": "^7.1.0",
+    "nanoid": "^5.1.2",
+    "socket.io": "^4.7.5"
+  }
+}
