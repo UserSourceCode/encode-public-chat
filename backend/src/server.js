@@ -19,21 +19,22 @@ app.use(express.json({ limit: "10mb" }));
 
 const server = http.createServer(app);
 
-// Mesmo domínio no Render = ok.
-// Se rodar front separado em dev: ORIGIN=http://localhost:5173
-const ORIGIN = process.env.ORIGIN || true;
-
+const ORIGIN = process.env.ORIGIN || true; // mesmo domínio no Render = ok
 const io = new SocketIOServer(server, {
   cors: { origin: ORIGIN },
-  maxHttpBufferSize: 6 * 1024 * 1024 // 6MB
+  maxHttpBufferSize: 6 * 1024 * 1024
 });
 
-// ---------------------- MEMÓRIA (NÃO PERSISTE) ----------------------
+// ===================================================================
+// MEMÓRIA (NÃO PERSISTE)
+// ===================================================================
 const rooms = new Map();    // roomId -> { id,type,name,passHash?,createdAt }
 const users = new Map();    // socketId -> { nick,roomId,ip,connectedAt }
 const messages = new Map(); // roomId -> Array<Message>
 
-// ---------------------- MÉTRICAS (OBSERVABILIDADE) ----------------------
+// ===================================================================
+// MÉTRICAS (OBSERVABILIDADE) — tudo em RAM
+// ===================================================================
 const metrics = {
   bootAt: Date.now(),
 
@@ -46,7 +47,7 @@ const metrics = {
   sessionsClosedCount: 0,
   sessionsClosedTotalMs: 0,
 
-  // Mensagens por minuto (rolling 60s)
+  // Mensagens por minuto (janela deslizante 60s)
   msgWindow: new Array(60).fill(0),
   msgWindowSec: Math.floor(Date.now() / 1000),
   peakMsgsPerMin: 0,
@@ -71,7 +72,6 @@ function updatePeaksOnline() {
     metrics.peakOnline = onlineNow;
     metrics.peakOnlineAt = Date.now();
   }
-  // por sala
   const counts = new Map();
   for (const [, u] of users.entries()) {
     counts.set(u.roomId, (counts.get(u.roomId) || 0) + 1);
@@ -84,7 +84,7 @@ function updatePeaksOnline() {
   }
 }
 
-// ---- Mensagens por minuto: janela deslizante de 60s ----
+// ---- msgs/min rolling 60s ----
 function rotateMsgWindowIfNeeded(nowSec) {
   let cur = metrics.msgWindowSec;
   if (nowSec <= cur) return;
@@ -95,7 +95,11 @@ function rotateMsgWindowIfNeeded(nowSec) {
   }
   metrics.msgWindowSec = nowSec;
 }
-
+function getMsgsPerMinNow() {
+  const nowSec = Math.floor(Date.now() / 1000);
+  rotateMsgWindowIfNeeded(nowSec);
+  return metrics.msgWindow.reduce((a, b) => a + b, 0);
+}
 function bumpMsgCounter() {
   const nowSec = Math.floor(Date.now() / 1000);
   rotateMsgWindowIfNeeded(nowSec);
@@ -109,18 +113,11 @@ function bumpMsgCounter() {
   }
 }
 
-function getMsgsPerMinNow() {
-  const nowSec = Math.floor(Date.now() / 1000);
-  rotateMsgWindowIfNeeded(nowSec);
-  return metrics.msgWindow.reduce((a, b) => a + b, 0);
-}
-
-// ---- Sessões ----
+// ---- sessões ----
 function getAvgSessionNowMs() {
   if (users.size === 0) return 0;
   const now = Date.now();
-  let total = 0;
-  let count = 0;
+  let total = 0, count = 0;
   for (const [, u] of users.entries()) {
     if (!u.connectedAt) continue;
     total += Math.max(0, now - u.connectedAt);
@@ -128,7 +125,6 @@ function getAvgSessionNowMs() {
   }
   return count ? Math.round(total / count) : 0;
 }
-
 function getAvgSessionAllMs() {
   const now = Date.now();
   let total = metrics.sessionsClosedTotalMs;
@@ -156,7 +152,9 @@ function roomSnapshot(roomId) {
   };
 }
 
-// ---------------------- BAN / MODERAÇÃO (RAM) ----------------------
+// ===================================================================
+// BAN / MODERAÇÃO (RAM)
+// ===================================================================
 const bansByIp = new Map(); // ip -> { until|null, reason }
 
 function getIp(reqOrSocket) {
@@ -180,7 +178,9 @@ function isBannedIp(ip) {
   return b;
 }
 
-// ---------------------- ADMIN AUTH ----------------------
+// ===================================================================
+// ADMIN AUTH
+// ===================================================================
 const ADMIN_PASS = process.env.ADMIN_PASS || "";
 const adminTokens = new Map(); // token -> { createdAt, expiresAt }
 
@@ -196,7 +196,9 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// ---------------------- HELPERS: USERS LIST / DM ----------------------
+// ===================================================================
+// HELPERS
+// ===================================================================
 function getRoomUsers(roomId) {
   const arr = [];
   for (const [sid, u] of users.entries()) {
@@ -205,7 +207,6 @@ function getRoomUsers(roomId) {
   arr.sort((a, b) => a.nick.localeCompare(b.nick, "pt-BR"));
   return arr;
 }
-
 function emitUsers(roomId) {
   io.to(roomId).emit("users_list", { roomId, users: getRoomUsers(roomId) });
 }
@@ -214,7 +215,6 @@ function dmIdFor(a, b) {
   const [x, y] = [a, b].sort();
   return `dm_${x}_${y}`;
 }
-
 function ensureDm(dmId) {
   if (!rooms.has(dmId)) rooms.set(dmId, { id: dmId, type: "dm", name: "Privado", createdAt: Date.now() });
   if (!messages.has(dmId)) messages.set(dmId, []);
@@ -226,7 +226,6 @@ function cleanupRoomIfEmpty(roomId) {
 
   if (count === 0) {
     if (messages.has(roomId)) messages.set(roomId, []);
-
     const r = rooms.get(roomId);
     if (r && (r.type === "group" || r.type === "dm")) {
       rooms.delete(roomId);
@@ -238,16 +237,18 @@ function cleanupRoomIfEmpty(roomId) {
 
 function removeUserMessages(socketId, roomId) {
   const arr = messages.get(roomId) || [];
-  if (arr.length === 0) return;
+  if (!arr.length) return;
 
   const removed = arr.filter(m => m.userId === socketId).map(m => m.id);
-  if (removed.length === 0) return;
+  if (!removed.length) return;
 
   messages.set(roomId, arr.filter(m => m.userId !== socketId));
   io.to(roomId).emit("message_deleted", { ids: removed });
 }
 
-// ---------------------- API ----------------------
+// ===================================================================
+// API (JSON)
+// ===================================================================
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 app.post("/api/groups", async (req, res) => {
@@ -278,7 +279,7 @@ app.get("/api/rooms/:id/public", (req, res) => {
   res.json({ ok: true, room: { id: r.id, type: r.type, name: r.name } });
 });
 
-// ---------------------- ADMIN API ----------------------
+// ----------------- ADMIN -----------------
 app.post("/api/admin/login", (req, res) => {
   const pass = String(req.body?.password || "");
   if (!ADMIN_PASS) return res.status(500).json({ ok: false, error: "ADMIN_PASS não configurado no servidor." });
@@ -293,7 +294,7 @@ app.post("/api/admin/login", (req, res) => {
 });
 
 app.get("/api/admin/metrics", requireAdmin, (req, res) => {
-  // Online por sala
+  // online por sala
   const roomCounts = new Map();
   for (const [, u] of users.entries()) {
     roomCounts.set(u.roomId, (roomCounts.get(u.roomId) || 0) + 1);
@@ -316,20 +317,20 @@ app.get("/api/admin/metrics", requireAdmin, (req, res) => {
   byRoom.sort((a, b) => (b.onlineNow - a.onlineNow) || a.name.localeCompare(b.name, "pt-BR"));
 
   // RAM
-  const mem = process.memoryUsage(); // bytes
-  const rss = mem.rss || 0;
-  const heapUsed = mem.heapUsed || 0;
-  const heapTotal = mem.heapTotal || 0;
-  const external = mem.external || 0;
+  const mem = process.memoryUsage();
+  const ram = {
+    rss: mem.rss || 0,
+    heapUsed: mem.heapUsed || 0,
+    heapTotal: mem.heapTotal || 0,
+    external: mem.external || 0,
+  };
 
   res.json({
     ok: true,
-
-    // boot/uptime
     bootAt: metrics.bootAt,
     uptimeSec: Math.floor(process.uptime()),
 
-    // online
+    // online/picos
     onlineNow: users.size,
     peakOnline: metrics.peakOnline,
     peakOnlineAt: metrics.peakOnlineAt,
@@ -348,7 +349,7 @@ app.get("/api/admin/metrics", requireAdmin, (req, res) => {
     peakMsgsPerMinAt: metrics.peakMsgsPerMinAt,
 
     // RAM
-    ram: { rss, heapUsed, heapTotal, external },
+    ram,
 
     byRoom
   });
@@ -392,13 +393,20 @@ app.post("/api/admin/ban-ip", requireAdmin, (req, res) => {
   res.json({ ok: true, ip, until });
 });
 
-// ---------------------- FRONTEND BUILD ----------------------
+// ✅ Se bater em /api e não existir rota, NUNCA devolve HTML:
+app.use("/api", (req, res) => res.status(404).json({ ok: false, error: "Rota da API não encontrada." }));
+
+// ===================================================================
+// FRONTEND (servir dist) + fallback CORRETO (não pega /api)
+// ===================================================================
 const frontendDist = path.resolve(__dirname, "..", "..", "frontend", "dist");
 const indexHtml = path.join(frontendDist, "index.html");
 
 if (fs.existsSync(indexHtml)) {
   app.use(express.static(frontendDist));
-  app.get("*", (req, res) => res.sendFile(indexHtml));
+
+  // ✅ Fallback do React (HashRouter) — MAS NÃO CAPTURA /api
+  app.get(/^\/(?!api).*/, (req, res) => res.sendFile(indexHtml));
 } else {
   app.get("*", (req, res) => {
     res.status(200).send(
@@ -419,9 +427,11 @@ Depois rode:
   });
 }
 
-// ---------------------- SOCKET.IO ----------------------
+// ===================================================================
+// SOCKET.IO
+// ===================================================================
 io.on("connection", (socket) => {
-  // bloquear por IP antes de tudo
+  // bloqueio por IP
   const ip = getIp(socket.request);
   const banned = isBannedIp(ip);
   if (banned) {
@@ -462,6 +472,7 @@ io.on("connection", (socket) => {
     emitUsers(roomId);
   });
 
+  // Mensagem sala (geral/grupo)
   socket.on("send_message", ({ type, content, roomId, replyTo }) => {
     const u = users.get(socket.id);
     if (!u) return;
@@ -474,7 +485,7 @@ io.on("connection", (socket) => {
     if (!allowed.has(t)) return;
 
     const c = String(content || "");
-    if (c.length < 1) return;
+    if (!c) return;
 
     if (t === "text" && c.length > 2000) return socket.emit("error_toast", { message: "Texto muito grande (máx 2000)." });
     if (t !== "text" && c.length > 5_500_000) return socket.emit("error_toast", { message: "Arquivo muito grande." });
@@ -501,7 +512,7 @@ io.on("connection", (socket) => {
     while (arr.length > 250) arr.shift();
     messages.set(rid, arr);
 
-    bumpMsgCounter(); // ✅ msgs/min (inclui texto/imagem/áudio)
+    bumpMsgCounter();
     io.to(rid).emit("new_message", msg);
   });
 
@@ -523,7 +534,7 @@ io.on("connection", (socket) => {
     io.to(rid).emit("message_reacted", { messageId: m.id, reactions: m.reactions });
   });
 
-  // ---------------------- DM ----------------------
+  // DM
   socket.on("start_dm", ({ peerSocketId }) => {
     const me = users.get(socket.id);
     if (!me) return;
@@ -531,7 +542,6 @@ io.on("connection", (socket) => {
     const peer = users.get(peerSocketId);
     if (!peer) return socket.emit("error_toast", { message: "Usuário não está mais online." });
 
-    // DM apenas dentro da mesma sala
     if (peer.roomId !== me.roomId) return socket.emit("error_toast", { message: "Usuário não está nessa sala." });
 
     const dmId = dmIdFor(socket.id, peerSocketId);
@@ -583,7 +593,7 @@ io.on("connection", (socket) => {
     while (arr.length > 200) arr.shift();
     messages.set(dmId, arr);
 
-    bumpMsgCounter(); // ✅ msgs/min também conta DM
+    bumpMsgCounter();
     io.to(dmId).emit("dm_new_message", { dmId, message: msg });
   });
 
@@ -602,7 +612,6 @@ io.on("connection", (socket) => {
     io.to(dmId).emit("dm_reacted", { dmId, messageId: m.id, reactions: m.reactions });
   });
 
-  // ---------------------- DISCONNECT ----------------------
   socket.on("disconnect", () => {
     const u = users.get(socket.id);
     if (!u) return;
@@ -630,6 +639,6 @@ io.on("connection", (socket) => {
   });
 });
 
-// ---------------------- START ----------------------
+// ===================================================================
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => console.log("Server on port", PORT));
