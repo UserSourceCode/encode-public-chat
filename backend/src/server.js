@@ -14,13 +14,13 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.set("trust proxy", 1);
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: "12mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 const server = http.createServer(app);
 
-// CORS: se front e back no mesmo domínio (Render), pode deixar true
+// Mesmo domínio no Render = ok.
+// Se rodar front separado em dev: ORIGIN=http://localhost:5173
 const ORIGIN = process.env.ORIGIN || true;
 
 const io = new SocketIOServer(server, {
@@ -28,102 +28,119 @@ const io = new SocketIOServer(server, {
   maxHttpBufferSize: 6 * 1024 * 1024 // 6MB
 });
 
-// -------------------- CONFIG ADMIN --------------------
-const ADMIN_PASS = String(process.env.ADMIN_PASS || "");
-const ADMIN_SECRET = String(process.env.ADMIN_SECRET || "");
+// ---------------------- MEMÓRIA (NÃO PERSISTE) ----------------------
+const rooms = new Map();    // roomId -> { id,type,name,passHash?,createdAt }
+const users = new Map();    // socketId -> { nick,roomId,ip,connectedAt }
+const messages = new Map(); // roomId -> Array<Message>
 
-if (!ADMIN_PASS) {
-  console.warn("[WARN] ADMIN_PASS não definido. Painel admin ficará inacessível.");
-}
+// ---------------------- MÉTRICAS (OBSERVABILIDADE) ----------------------
+const metrics = {
+  bootAt: Date.now(),
 
-const adminKey = crypto
-  .createHash("sha256")
-  .update(ADMIN_SECRET || ("fallback:" + ADMIN_PASS))
-  .digest("hex");
+  // Online
+  peakOnline: 0,
+  peakOnlineAt: null,
+  peakByRoom: new Map(), // roomId -> { peak, at }
 
-function signAdminToken(payload) {
-  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
-  const sig = crypto.createHmac("sha256", adminKey).update(body).digest("base64url");
-  return `${body}.${sig}`;
-}
+  // Sessões
+  sessionsClosedCount: 0,
+  sessionsClosedTotalMs: 0,
 
-function verifyAdminToken(token) {
-  if (!token || typeof token !== "string") return null;
-  const [body, sig] = token.split(".");
-  if (!body || !sig) return null;
-  const expected = crypto.createHmac("sha256", adminKey).update(body).digest("base64url");
-  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
-  const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
-  if (!payload?.exp || Date.now() > payload.exp) return null;
-  return payload;
-}
-
-function requireAdmin(req, res, next) {
-  try {
-    const h = String(req.headers.authorization || "");
-    const m = h.match(/^Bearer\s+(.+)$/i);
-    const token = m ? m[1] : "";
-    const payload = verifyAdminToken(token);
-    if (!payload) return res.status(401).json({ ok: false, error: "Não autorizado." });
-    req.admin = payload;
-    next();
-  } catch {
-    return res.status(401).json({ ok: false, error: "Não autorizado." });
-  }
-}
-
-// -------------------- MEMÓRIA (SEM PERSISTÊNCIA) --------------------
-/**
- * rooms:
- *  - "geral" sempre existe
- *  - group: "g_xxxxx"
- *  - dm: "dm_<a>_<b>"
- *
- * users:
- *  - socketId -> { nick, roomId, ip, joinedAt }
- *
- * messages:
- *  - roomId -> Array<Message>
- *
- * bans:
- *  - ip -> { until, reason }
- */
-const rooms = new Map();
-const users = new Map();
-const messages = new Map();
-const bans = new Map(); // ip -> {until, reason}
-let freezeGroups = false;
-
-function now() { return Date.now(); }
-
-function normalizeIP(ip) {
-  ip = String(ip || "");
-  // socket.io/express podem fornecer "::ffff:127.0.0.1"
-  if (ip.startsWith("::ffff:")) ip = ip.slice(7);
-  return ip;
-}
-
-function isIpBanned(ip) {
-  const b = bans.get(ip);
-  if (!b) return false;
-  if (b.until && now() > b.until) {
-    bans.delete(ip);
-    return false;
-  }
-  return true;
-}
+  // Mensagens por minuto (rolling 60s)
+  msgWindow: new Array(60).fill(0),
+  msgWindowSec: Math.floor(Date.now() / 1000),
+  peakMsgsPerMin: 0,
+  peakMsgsPerMinAt: null,
+};
 
 function ensureRoom(roomId) {
   if (!rooms.has(roomId)) {
     if (roomId === "geral") {
-      rooms.set(roomId, { id: "geral", type: "public", name: "Geral", createdAt: now() });
+      rooms.set(roomId, { id: "geral", type: "public", name: "Geral", createdAt: Date.now() });
     } else {
-      rooms.set(roomId, { id: roomId, type: "public", name: "Sala", createdAt: now() });
+      rooms.set(roomId, { id: roomId, type: "public", name: "Sala", createdAt: Date.now() });
     }
   }
   if (!messages.has(roomId)) messages.set(roomId, []);
 }
 ensureRoom("geral");
+
+function updatePeaksOnline() {
+  const onlineNow = users.size;
+  if (onlineNow > metrics.peakOnline) {
+    metrics.peakOnline = onlineNow;
+    metrics.peakOnlineAt = Date.now();
+  }
+  // por sala
+  const counts = new Map();
+  for (const [, u] of users.entries()) {
+    counts.set(u.roomId, (counts.get(u.roomId) || 0) + 1);
+  }
+  for (const [rid, cnt] of counts.entries()) {
+    const prev = metrics.peakByRoom.get(rid);
+    if (!prev || cnt > prev.peak) {
+      metrics.peakByRoom.set(rid, { peak: cnt, at: Date.now() });
+    }
+  }
+}
+
+// ---- Mensagens por minuto: janela deslizante de 60s ----
+function rotateMsgWindowIfNeeded(nowSec) {
+  let cur = metrics.msgWindowSec;
+  if (nowSec <= cur) return;
+  const diff = Math.min(60, nowSec - cur);
+  for (let i = 0; i < diff; i++) {
+    const idx = (cur + 1 + i) % 60;
+    metrics.msgWindow[idx] = 0;
+  }
+  metrics.msgWindowSec = nowSec;
+}
+
+function bumpMsgCounter() {
+  const nowSec = Math.floor(Date.now() / 1000);
+  rotateMsgWindowIfNeeded(nowSec);
+  const idx = nowSec % 60;
+  metrics.msgWindow[idx] += 1;
+
+  const nowMpm = getMsgsPerMinNow();
+  if (nowMpm > metrics.peakMsgsPerMin) {
+    metrics.peakMsgsPerMin = nowMpm;
+    metrics.peakMsgsPerMinAt = Date.now();
+  }
+}
+
+function getMsgsPerMinNow() {
+  const nowSec = Math.floor(Date.now() / 1000);
+  rotateMsgWindowIfNeeded(nowSec);
+  return metrics.msgWindow.reduce((a, b) => a + b, 0);
+}
+
+// ---- Sessões ----
+function getAvgSessionNowMs() {
+  if (users.size === 0) return 0;
+  const now = Date.now();
+  let total = 0;
+  let count = 0;
+  for (const [, u] of users.entries()) {
+    if (!u.connectedAt) continue;
+    total += Math.max(0, now - u.connectedAt);
+    count++;
+  }
+  return count ? Math.round(total / count) : 0;
+}
+
+function getAvgSessionAllMs() {
+  const now = Date.now();
+  let total = metrics.sessionsClosedTotalMs;
+  let count = metrics.sessionsClosedCount;
+
+  for (const [, u] of users.entries()) {
+    if (!u.connectedAt) continue;
+    total += Math.max(0, now - u.connectedAt);
+    count++;
+  }
+  return count ? Math.round(total / count) : 0;
+}
 
 function sanitizeNick(nick) {
   nick = String(nick || "").trim().replace(/\s+/g, " ");
@@ -133,44 +150,64 @@ function sanitizeNick(nick) {
 }
 
 function roomSnapshot(roomId) {
-  return { room: rooms.get(roomId), messages: messages.get(roomId) || [] };
+  return {
+    room: rooms.get(roomId),
+    messages: messages.get(roomId) || []
+  };
 }
 
-function removeUserMessages(socketId, roomId) {
-  const arr = messages.get(roomId) || [];
-  if (!arr.length) return;
+// ---------------------- BAN / MODERAÇÃO (RAM) ----------------------
+const bansByIp = new Map(); // ip -> { until|null, reason }
 
-  const removedIds = arr.filter(m => m.userId === socketId).map(m => m.id);
-  if (!removedIds.length) return;
-
-  messages.set(roomId, arr.filter(m => m.userId !== socketId));
-  io.to(roomId).emit("message_deleted", { ids: removedIds });
+function getIp(reqOrSocket) {
+  const xff = reqOrSocket?.headers?.["x-forwarded-for"];
+  const raw = Array.isArray(xff) ? xff[0] : xff;
+  const ip =
+    (raw ? String(raw).split(",")[0].trim() : "") ||
+    reqOrSocket?.ip ||
+    reqOrSocket?.handshake?.address ||
+    "";
+  return ip || "unknown";
 }
 
-function cleanupRoomIfEmpty(roomId) {
-  const socketsInRoom = io.sockets.adapter.rooms.get(roomId);
-  const count = socketsInRoom ? socketsInRoom.size : 0;
-  if (count === 0) {
-    messages.set(roomId, []);
-    const r = rooms.get(roomId);
-    if (r && (r.type === "group" || r.type === "dm")) {
-      rooms.delete(roomId);
-      messages.delete(roomId);
-    }
+function isBannedIp(ip) {
+  const b = bansByIp.get(ip);
+  if (!b) return null;
+  if (b.until && Date.now() > b.until) {
+    bansByIp.delete(ip);
+    return null;
   }
+  return b;
 }
 
+// ---------------------- ADMIN AUTH ----------------------
+const ADMIN_PASS = process.env.ADMIN_PASS || "";
+const adminTokens = new Map(); // token -> { createdAt, expiresAt }
+
+function requireAdmin(req, res, next) {
+  const auth = String(req.headers.authorization || "");
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  const t = adminTokens.get(token);
+  if (!t) return res.status(401).json({ ok: false, error: "Não autorizado" });
+  if (t.expiresAt && Date.now() > t.expiresAt) {
+    adminTokens.delete(token);
+    return res.status(401).json({ ok: false, error: "Sessão expirada" });
+  }
+  next();
+}
+
+// ---------------------- HELPERS: USERS LIST / DM ----------------------
 function getRoomUsers(roomId) {
   const arr = [];
   for (const [sid, u] of users.entries()) {
-    if (u.roomId === roomId) arr.push({ socketId: sid, nick: u.nick, ip: u.ip, joinedAt: u.joinedAt });
+    if (u.roomId === roomId) arr.push({ socketId: sid, nick: u.nick });
   }
   arr.sort((a, b) => a.nick.localeCompare(b.nick, "pt-BR"));
   return arr;
 }
 
 function emitUsers(roomId) {
-  io.to(roomId).emit("users_list", { roomId, users: getRoomUsers(roomId).map(u => ({ socketId: u.socketId, nick: u.nick })) });
+  io.to(roomId).emit("users_list", { roomId, users: getRoomUsers(roomId) });
 }
 
 function dmIdFor(a, b) {
@@ -179,42 +216,42 @@ function dmIdFor(a, b) {
 }
 
 function ensureDm(dmId) {
-  if (!rooms.has(dmId)) rooms.set(dmId, { id: dmId, type: "dm", name: "Privado", createdAt: now() });
+  if (!rooms.has(dmId)) rooms.set(dmId, { id: dmId, type: "dm", name: "Privado", createdAt: Date.now() });
   if (!messages.has(dmId)) messages.set(dmId, []);
 }
 
-function dmMetaList() {
-  const out = [];
-  for (const [rid, r] of rooms.entries()) {
-    if (r?.type !== "dm") continue;
-    const socketsInRoom = io.sockets.adapter.rooms.get(rid);
-    const count = socketsInRoom ? socketsInRoom.size : 0;
-    // participantes (nick) a partir do map users
-    const participants = [];
-    if (socketsInRoom) {
-      for (const sid of socketsInRoom.values()) {
-        const u = users.get(sid);
-        if (u) participants.push({ socketId: sid, nick: u.nick });
-      }
+function cleanupRoomIfEmpty(roomId) {
+  const socketsInRoom = io.sockets.adapter.rooms.get(roomId);
+  const count = socketsInRoom ? socketsInRoom.size : 0;
+
+  if (count === 0) {
+    if (messages.has(roomId)) messages.set(roomId, []);
+
+    const r = rooms.get(roomId);
+    if (r && (r.type === "group" || r.type === "dm")) {
+      rooms.delete(roomId);
+      messages.delete(roomId);
+      metrics.peakByRoom.delete(roomId);
     }
-    out.push({
-      id: rid,
-      participants,
-      onlineCount: count,
-      msgCount: (messages.get(rid) || []).length,
-      createdAt: r.createdAt
-    });
   }
-  return out.sort((a, b) => b.createdAt - a.createdAt);
 }
 
-// -------------------- REST API BÁSICO --------------------
+function removeUserMessages(socketId, roomId) {
+  const arr = messages.get(roomId) || [];
+  if (arr.length === 0) return;
+
+  const removed = arr.filter(m => m.userId === socketId).map(m => m.id);
+  if (removed.length === 0) return;
+
+  messages.set(roomId, arr.filter(m => m.userId !== socketId));
+  io.to(roomId).emit("message_deleted", { ids: removed });
+}
+
+// ---------------------- API ----------------------
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 app.post("/api/groups", async (req, res) => {
   try {
-    if (freezeGroups) return res.status(403).json({ ok: false, error: "Criação de grupos está bloqueada pelo administrador." });
-
     const name = String(req.body?.name || "").trim() || "Grupo";
     const pass = String(req.body?.password || "");
     const nick = sanitizeNick(req.body?.nick);
@@ -225,7 +262,7 @@ app.post("/api/groups", async (req, res) => {
     const id = "g_" + nanoid(10);
     const passHash = await bcrypt.hash(pass, 10);
 
-    rooms.set(id, { id, type: "group", name: name.slice(0, 32), passHash, createdAt: now() });
+    rooms.set(id, { id, type: "group", name: name.slice(0, 32), passHash, createdAt: Date.now() });
     messages.set(id, []);
 
     res.json({ ok: true, groupId: id, linkPath: `/#/g/${id}` });
@@ -241,146 +278,121 @@ app.get("/api/rooms/:id/public", (req, res) => {
   res.json({ ok: true, room: { id: r.id, type: r.type, name: r.name } });
 });
 
-// -------------------- ADMIN REST --------------------
-app.post("/api/admin/login", async (req, res) => {
+// ---------------------- ADMIN API ----------------------
+app.post("/api/admin/login", (req, res) => {
   const pass = String(req.body?.password || "");
-  if (!ADMIN_PASS) return res.status(403).json({ ok: false, error: "Admin desativado." });
-  if (pass !== ADMIN_PASS) return res.status(401).json({ ok: false, error: "Senha incorreta." });
+  if (!ADMIN_PASS) return res.status(500).json({ ok: false, error: "ADMIN_PASS não configurado no servidor." });
+  if (pass !== ADMIN_PASS) return res.status(401).json({ ok: false, error: "Senha inválida." });
 
-  const token = signAdminToken({ role: "admin", exp: now() + 1000 * 60 * 60 * 6 }); // 6h
-  res.json({ ok: true, token });
+  const token = crypto.randomBytes(24).toString("hex");
+  const createdAt = Date.now();
+  const expiresAt = createdAt + 12 * 60 * 60 * 1000; // 12h
+  adminTokens.set(token, { createdAt, expiresAt });
+
+  res.json({ ok: true, token, expiresAt });
 });
 
-app.get("/api/admin/state", requireAdmin, (req, res) => {
-  const roomList = [];
-  for (const [rid, r] of rooms.entries()) {
-    if (!r) continue;
-    const socketsInRoom = io.sockets.adapter.rooms.get(rid);
-    const online = socketsInRoom ? socketsInRoom.size : 0;
+app.get("/api/admin/metrics", requireAdmin, (req, res) => {
+  // Online por sala
+  const roomCounts = new Map();
+  for (const [, u] of users.entries()) {
+    roomCounts.set(u.roomId, (roomCounts.get(u.roomId) || 0) + 1);
+  }
 
-    roomList.push({
-      id: r.id,
-      type: r.type,
+  const byRoom = [];
+  for (const [rid, r] of rooms.entries()) {
+    const onlineNow = roomCounts.get(rid) || 0;
+    const peakObj = metrics.peakByRoom.get(rid) || { peak: 0, at: null };
+    byRoom.push({
+      id: rid,
       name: r.name,
-      createdAt: r.createdAt,
-      onlineCount: online,
-      msgCount: (messages.get(rid) || []).length
+      type: r.type,
+      onlineNow,
+      peakOnline: peakObj.peak || 0,
+      peakOnlineAt: peakObj.at || null,
+      createdAt: r.createdAt || null
     });
   }
+  byRoom.sort((a, b) => (b.onlineNow - a.onlineNow) || a.name.localeCompare(b.name, "pt-BR"));
 
-  // mensagens VISÍVEIS: apenas geral + grupos (não DM)
-  const visibleMessages = {};
-  for (const [rid, r] of rooms.entries()) {
-    if (!r) continue;
-    if (r.type === "public" || r.type === "group") {
-      visibleMessages[rid] = (messages.get(rid) || []).slice(-250);
-    }
-  }
-
-  const onlineUsers = [];
-  for (const [sid, u] of users.entries()) {
-    onlineUsers.push({ socketId: sid, nick: u.nick, roomId: u.roomId, ip: u.ip, joinedAt: u.joinedAt });
-  }
+  // RAM
+  const mem = process.memoryUsage(); // bytes
+  const rss = mem.rss || 0;
+  const heapUsed = mem.heapUsed || 0;
+  const heapTotal = mem.heapTotal || 0;
+  const external = mem.external || 0;
 
   res.json({
     ok: true,
-    freezeGroups,
-    bans: Array.from(bans.entries()).map(([ip, b]) => ({ ip, until: b.until || null, reason: b.reason || "" })),
-    rooms: roomList.sort((a, b) => (b.onlineCount - a.onlineCount) || (b.createdAt - a.createdAt)),
-    users: onlineUsers.sort((a, b) => (a.roomId || "").localeCompare(b.roomId || "") || a.nick.localeCompare(b.nick, "pt-BR")),
-    messages: visibleMessages,
-    dms: dmMetaList()
-  });
-});
 
-app.post("/api/admin/freeze-groups", requireAdmin, (req, res) => {
-  freezeGroups = !!req.body?.enabled;
-  res.json({ ok: true, freezeGroups });
+    // boot/uptime
+    bootAt: metrics.bootAt,
+    uptimeSec: Math.floor(process.uptime()),
+
+    // online
+    onlineNow: users.size,
+    peakOnline: metrics.peakOnline,
+    peakOnlineAt: metrics.peakOnlineAt,
+    roomsTotal: rooms.size,
+    groupsTotal: Array.from(rooms.values()).filter(x => x.type === "group").length,
+    dmActive: Array.from(rooms.values()).filter(x => x.type === "dm").length,
+
+    // sessões
+    avgSessionNowMs: getAvgSessionNowMs(),
+    avgSessionAllMs: getAvgSessionAllMs(),
+    sessionsClosedCount: metrics.sessionsClosedCount,
+
+    // msgs/min
+    msgsPerMinNow: getMsgsPerMinNow(),
+    peakMsgsPerMin: metrics.peakMsgsPerMin,
+    peakMsgsPerMinAt: metrics.peakMsgsPerMinAt,
+
+    // RAM
+    ram: { rss, heapUsed, heapTotal, external },
+
+    byRoom
+  });
 });
 
 app.post("/api/admin/warn", requireAdmin, (req, res) => {
   const socketId = String(req.body?.socketId || "");
-  const message = String(req.body?.message || "Atenção: moderação.").slice(0, 220);
-  const s = io.sockets.sockets.get(socketId);
-  if (!s) return res.status(404).json({ ok: false, error: "Usuário não encontrado." });
-
-  s.emit("admin_warn", { message });
+  const message = String(req.body?.message || "").trim().slice(0, 220);
+  if (!socketId || !message) return res.status(400).json({ ok: false, error: "socketId e message são obrigatórios." });
+  io.to(socketId).emit("admin_notice", { message });
   res.json({ ok: true });
 });
 
 app.post("/api/admin/kick", requireAdmin, (req, res) => {
   const socketId = String(req.body?.socketId || "");
+  const message = String(req.body?.message || "Você foi removido pelo administrador.").trim().slice(0, 220);
+
   const s = io.sockets.sockets.get(socketId);
   if (!s) return res.status(404).json({ ok: false, error: "Usuário não encontrado." });
 
-  s.emit("admin_warn", { message: "Você foi desconectado pela moderação." });
-  s.disconnect(true);
+  io.to(socketId).emit("admin_kick", { message });
+  setTimeout(() => { try { s.disconnect(true); } catch {} }, 120);
   res.json({ ok: true });
 });
 
 app.post("/api/admin/ban-ip", requireAdmin, (req, res) => {
-  const ip = normalizeIP(req.body?.ip);
+  const socketId = String(req.body?.socketId || "");
   const minutes = Number(req.body?.minutes || 0);
-  const reason = String(req.body?.reason || "Moderação").slice(0, 120);
+  const reason = String(req.body?.reason || "Acesso bloqueado pelo administrador.").trim().slice(0, 220);
 
-  if (!ip) return res.status(400).json({ ok: false, error: "IP inválido." });
+  const s = io.sockets.sockets.get(socketId);
+  if (!s) return res.status(404).json({ ok: false, error: "Usuário não encontrado." });
 
-  const until = minutes > 0 ? (now() + minutes * 60 * 1000) : null; // null = até reiniciar
-  bans.set(ip, { until, reason });
+  const ip = users.get(socketId)?.ip || getIp(s.request);
+  const until = minutes > 0 ? (Date.now() + minutes * 60 * 1000) : null;
+  bansByIp.set(ip, { until, reason });
 
-  // derruba todos que estiverem nesse IP
-  for (const [sid, u] of users.entries()) {
-    if (u.ip === ip) {
-      const s = io.sockets.sockets.get(sid);
-      if (s) {
-        s.emit("admin_warn", { message: "Você foi banido pela moderação." });
-        s.disconnect(true);
-      }
-    }
-  }
+  io.to(socketId).emit("admin_ban", { message: reason });
+  setTimeout(() => { try { s.disconnect(true); } catch {} }, 120);
 
-  res.json({ ok: true });
+  res.json({ ok: true, ip, until });
 });
 
-app.post("/api/admin/unban-ip", requireAdmin, (req, res) => {
-  const ip = normalizeIP(req.body?.ip);
-  bans.delete(ip);
-  res.json({ ok: true });
-});
-
-app.post("/api/admin/clear-room", requireAdmin, (req, res) => {
-  const roomId = String(req.body?.roomId || "");
-  const r = rooms.get(roomId);
-  if (!r) return res.status(404).json({ ok: false, error: "Sala não existe." });
-  if (!(r.type === "public" || r.type === "group")) return res.status(400).json({ ok: false, error: "Só é permitido limpar Geral/Grupo." });
-
-  messages.set(roomId, []);
-  io.to(roomId).emit("room_cleared", { roomId });
-  res.json({ ok: true });
-});
-
-app.post("/api/admin/close-dm", requireAdmin, (req, res) => {
-  const dmId = String(req.body?.dmId || "");
-  const r = rooms.get(dmId);
-  if (!r || r.type !== "dm") return res.status(404).json({ ok: false, error: "DM não encontrado." });
-
-  messages.delete(dmId);
-  rooms.delete(dmId);
-
-  // avisa quem estava na sala e faz sair
-  io.to(dmId).emit("dm_closed", { dmId });
-  // remove todo mundo da sala dm
-  const socketsInRoom = io.sockets.adapter.rooms.get(dmId);
-  if (socketsInRoom) {
-    for (const sid of socketsInRoom.values()) {
-      const s = io.sockets.sockets.get(sid);
-      if (s) s.leave(dmId);
-    }
-  }
-  res.json({ ok: true });
-});
-
-// -------------------- SERVIR FRONTEND BUILD --------------------
+// ---------------------- FRONTEND BUILD ----------------------
 const frontendDist = path.resolve(__dirname, "..", "..", "frontend", "dist");
 const indexHtml = path.join(frontendDist, "index.html");
 
@@ -407,25 +419,25 @@ Depois rode:
   });
 }
 
-// -------------------- SOCKET.IO --------------------
+// ---------------------- SOCKET.IO ----------------------
 io.on("connection", (socket) => {
-  const ip = normalizeIP(socket.handshake.address);
-
-  if (isIpBanned(ip)) {
-    socket.emit("error_toast", { message: "Acesso bloqueado pela moderação." });
-    socket.disconnect(true);
-    return;
+  // bloquear por IP antes de tudo
+  const ip = getIp(socket.request);
+  const banned = isBannedIp(ip);
+  if (banned) {
+    socket.emit("admin_ban", { message: banned.reason || "Acesso bloqueado." });
+    return socket.disconnect(true);
   }
 
   socket.on("join_public", ({ nick }) => {
     nick = sanitizeNick(nick);
     if (!nick) return socket.emit("error_toast", { message: "Apelido inválido." });
-    if (isIpBanned(ip)) return socket.emit("error_toast", { message: "Acesso bloqueado pela moderação." });
 
     ensureRoom("geral");
-    users.set(socket.id, { nick, roomId: "geral", ip, joinedAt: now() });
-
+    users.set(socket.id, { nick, roomId: "geral", ip, connectedAt: Date.now() });
     socket.join("geral");
+
+    updatePeaksOnline();
     socket.emit("room_snapshot", roomSnapshot("geral"));
     io.to("geral").emit("presence", { type: "join", nick });
     emitUsers("geral");
@@ -434,7 +446,6 @@ io.on("connection", (socket) => {
   socket.on("join_group", async ({ roomId, nick, password }) => {
     nick = sanitizeNick(nick);
     if (!nick) return socket.emit("error_toast", { message: "Apelido inválido." });
-    if (isIpBanned(ip)) return socket.emit("error_toast", { message: "Acesso bloqueado pela moderação." });
 
     const r = rooms.get(roomId);
     if (!r || r.type !== "group") return socket.emit("error_toast", { message: "Grupo não existe (ou já expirou)." });
@@ -442,9 +453,10 @@ io.on("connection", (socket) => {
     const ok = await bcrypt.compare(String(password || ""), r.passHash);
     if (!ok) return socket.emit("error_toast", { message: "Senha incorreta." });
 
-    users.set(socket.id, { nick, roomId, ip, joinedAt: now() });
+    users.set(socket.id, { nick, roomId, ip, connectedAt: Date.now() });
     socket.join(roomId);
 
+    updatePeaksOnline();
     socket.emit("room_snapshot", roomSnapshot(roomId));
     io.to(roomId).emit("presence", { type: "join", nick });
     emitUsers(roomId);
@@ -453,7 +465,6 @@ io.on("connection", (socket) => {
   socket.on("send_message", ({ type, content, roomId, replyTo }) => {
     const u = users.get(socket.id);
     if (!u) return;
-    if (isIpBanned(ip)) return;
 
     const rid = u.roomId;
     if (roomId && roomId !== rid) return;
@@ -463,7 +474,7 @@ io.on("connection", (socket) => {
     if (!allowed.has(t)) return;
 
     const c = String(content || "");
-    if (!c) return;
+    if (c.length < 1) return;
 
     if (t === "text" && c.length > 2000) return socket.emit("error_toast", { message: "Texto muito grande (máx 2000)." });
     if (t !== "text" && c.length > 5_500_000) return socket.emit("error_toast", { message: "Arquivo muito grande." });
@@ -475,14 +486,14 @@ io.on("connection", (socket) => {
       nick: u.nick,
       type: t,
       content: c,
-      ts: now(),
+      ts: Date.now(),
       reactions: {},
       replyTo: replyTo && replyTo.id ? {
         id: String(replyTo.id),
         nick: String(replyTo.nick || "").slice(0, 18),
         preview: String(replyTo.preview || "").slice(0, 140),
         type: String(replyTo.type || "text")
-      } : null
+      } : null,
     };
 
     const arr = messages.get(rid) || [];
@@ -490,13 +501,13 @@ io.on("connection", (socket) => {
     while (arr.length > 250) arr.shift();
     messages.set(rid, arr);
 
+    bumpMsgCounter(); // ✅ msgs/min (inclui texto/imagem/áudio)
     io.to(rid).emit("new_message", msg);
   });
 
   socket.on("react_message", ({ roomId, messageId, emoji }) => {
     const u = users.get(socket.id);
     if (!u) return;
-    if (isIpBanned(ip)) return;
 
     const rid = u.roomId;
     if (roomId && roomId !== rid) return;
@@ -512,16 +523,15 @@ io.on("connection", (socket) => {
     io.to(rid).emit("message_reacted", { messageId: m.id, reactions: m.reactions });
   });
 
-  // -------- DM (conteúdo NÃO exposto ao admin; admin só vê meta + pode encerrar) --------
+  // ---------------------- DM ----------------------
   socket.on("start_dm", ({ peerSocketId }) => {
     const me = users.get(socket.id);
     if (!me) return;
-    if (isIpBanned(ip)) return;
 
     const peer = users.get(peerSocketId);
     if (!peer) return socket.emit("error_toast", { message: "Usuário não está mais online." });
 
-    // DM apenas se estiverem na mesma sala pública/grupo
+    // DM apenas dentro da mesma sala
     if (peer.roomId !== me.roomId) return socket.emit("error_toast", { message: "Usuário não está nessa sala." });
 
     const dmId = dmIdFor(socket.id, peerSocketId);
@@ -540,7 +550,6 @@ io.on("connection", (socket) => {
   socket.on("send_dm", ({ dmId, type, content, replyTo }) => {
     const me = users.get(socket.id);
     if (!me) return;
-    if (isIpBanned(ip)) return;
 
     const r = rooms.get(dmId);
     if (!r || r.type !== "dm") return;
@@ -552,9 +561,6 @@ io.on("connection", (socket) => {
     const c = String(content || "");
     if (!c) return;
 
-    if (t === "text" && c.length > 2000) return socket.emit("error_toast", { message: "Texto muito grande (máx 2000)." });
-    if (t !== "text" && c.length > 5_500_000) return socket.emit("error_toast", { message: "Arquivo muito grande." });
-
     const msg = {
       id: "m_" + nanoid(10),
       roomId: dmId,
@@ -562,7 +568,7 @@ io.on("connection", (socket) => {
       nick: me.nick,
       type: t,
       content: c,
-      ts: now(),
+      ts: Date.now(),
       reactions: {},
       replyTo: replyTo && replyTo.id ? {
         id: String(replyTo.id),
@@ -577,13 +583,13 @@ io.on("connection", (socket) => {
     while (arr.length > 200) arr.shift();
     messages.set(dmId, arr);
 
+    bumpMsgCounter(); // ✅ msgs/min também conta DM
     io.to(dmId).emit("dm_new_message", { dmId, message: msg });
   });
 
   socket.on("react_dm", ({ dmId, messageId, emoji }) => {
     const r = rooms.get(dmId);
     if (!r || r.type !== "dm") return;
-    if (isIpBanned(ip)) return;
 
     emoji = String(emoji || "").trim().slice(0, 4);
     if (!emoji) return;
@@ -596,9 +602,17 @@ io.on("connection", (socket) => {
     io.to(dmId).emit("dm_reacted", { dmId, messageId: m.id, reactions: m.reactions });
   });
 
+  // ---------------------- DISCONNECT ----------------------
   socket.on("disconnect", () => {
     const u = users.get(socket.id);
     if (!u) return;
+
+    // sessões encerradas
+    if (u.connectedAt) {
+      const dur = Math.max(0, Date.now() - u.connectedAt);
+      metrics.sessionsClosedCount += 1;
+      metrics.sessionsClosedTotalMs += dur;
+    }
 
     const { nick, roomId } = u;
     users.delete(socket.id);
@@ -609,19 +623,13 @@ io.on("connection", (socket) => {
 
     setTimeout(() => cleanupRoomIfEmpty(roomId), 50);
 
-    // limpa DMs vazias
-    setTimeout(() => {
-      for (const [rid, info] of rooms.entries()) {
-        if (info?.type !== "dm") continue;
-        cleanupRoomIfEmpty(rid);
-      }
-    }, 120);
+    // limpa DMs órfãos
+    for (const [rid, info] of rooms.entries()) {
+      if (info?.type === "dm") setTimeout(() => cleanupRoomIfEmpty(rid), 80);
+    }
   });
 });
 
-// -------------------- START --------------------
+// ---------------------- START ----------------------
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => {
-  console.log("Server on port", PORT);
-  console.log("Frontend dist:", frontendDist);
-});
+server.listen(PORT, () => console.log("Server on port", PORT));

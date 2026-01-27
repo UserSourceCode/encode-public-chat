@@ -1,329 +1,309 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import Modal from "../ui/Modal.jsx";
 import Toast from "../ui/Toast.jsx";
 
-function fmtDate(ts){
-  if(!ts) return "-";
-  const d = new Date(ts);
-  return d.toLocaleString("pt-BR", { day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit" });
+function fmtTime(ts){
+  if(!ts) return "—";
+  return new Date(ts).toLocaleString("pt-BR", {
+    day:"2-digit", month:"2-digit",
+    hour:"2-digit", minute:"2-digit", second:"2-digit"
+  });
+}
+function fmtSince(ts){
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  const h = Math.floor(s/3600);
+  const m = Math.floor((s%3600)/60);
+  const ss = s%60;
+  return h>0 ? `${h}h ${m}m` : `${m}m ${ss}s`;
+}
+function fmtDur(ms){
+  const s = Math.max(0, Math.floor(ms/1000));
+  const h = Math.floor(s/3600);
+  const m = Math.floor((s%3600)/60);
+  const ss = s%60;
+  if(h>0) return `${h}h ${m}m`;
+  if(m>0) return `${m}m ${ss}s`;
+  return `${ss}s`;
+}
+function fmtBytes(b){
+  const n = Number(b || 0);
+  if(n < 1024) return `${n} B`;
+  const kb = n / 1024;
+  if(kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  if(mb < 1024) return `${mb.toFixed(1)} MB`;
+  const gb = mb / 1024;
+  return `${gb.toFixed(2)} GB`;
 }
 
 export default function Admin(){
-  const [toast, setToast] = useState("");
-  const [token, setToken] = useState(() => sessionStorage.getItem("admin_token") || "");
-  const [pass, setPass] = useState("");
-  const [state, setState] = useState(null);
-  const [busy, setBusy] = useState(false);
+  const nav = useNavigate();
 
-  const authHeaders = useMemo(()=>{
-    return token ? { Authorization: `Bearer ${token}` } : {};
-  }, [token]);
+  const [toast, setToast] = useState("");
+  const [openLogin, setOpenLogin] = useState(false);
+  const [pass, setPass] = useState("");
+
+  const [token, setToken] = useState(() => sessionStorage.getItem("admin_token") || "");
+  const [exp, setExp] = useState(() => Number(sessionStorage.getItem("admin_exp") || 0));
+
+  const [metrics, setMetrics] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const isAuthed = useMemo(()=>{
+    if(!token) return false;
+    if(exp && Date.now() > exp) return false;
+    return true;
+  }, [token, exp]);
+
+  async function api(path, opts={}){
+    const r = await fetch(path, {
+      ...opts,
+      headers: {
+        "Content-Type": "application/json",
+        ...(opts.headers || {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
+      }
+    });
+    const j = await r.json().catch(()=>null);
+    if(!r.ok){
+      throw new Error(j?.error || `Erro ${r.status}`);
+    }
+    return j;
+  }
 
   async function login(e){
     e.preventDefault();
-    setBusy(true);
     try{
-      const r = await fetch("/api/admin/login", {
+      const j = await fetch("/api/admin/login", {
         method:"POST",
         headers:{ "Content-Type":"application/json" },
         body: JSON.stringify({ password: pass })
-      });
-      const j = await r.json();
-      if(!j.ok) throw new Error(j.error || "Falha no login");
+      }).then(r=>r.json());
+
+      if(!j.ok){
+        setToast(j.error || "Senha inválida");
+        return;
+      }
+
       sessionStorage.setItem("admin_token", j.token);
+      sessionStorage.setItem("admin_exp", String(j.expiresAt || 0));
       setToken(j.token);
+      setExp(j.expiresAt || 0);
       setPass("");
-      setToast("Admin autenticado.");
-    }catch(err){
-      setToast(err.message || "Erro");
-    }finally{
-      setBusy(false);
+      setOpenLogin(false);
+      setToast("Acesso liberado.");
+    }catch{
+      setToast("Falha no login.");
     }
   }
 
-  async function load(){
-    if(!token) return;
+  function logout(){
+    sessionStorage.removeItem("admin_token");
+    sessionStorage.removeItem("admin_exp");
+    setToken("");
+    setExp(0);
+    setMetrics(null);
+    setToast("Sessão encerrada.");
+  }
+
+  async function loadMetrics(){
+    if(!isAuthed) return;
+    setLoading(true);
     try{
-      const r = await fetch("/api/admin/state", { headers: { ...authHeaders } });
-      const j = await r.json();
-      if(!j.ok) throw new Error(j.error || "Não autorizado");
-      setState(j);
-    }catch(err){
-      setToast(err.message || "Erro");
-      // se token expirou
-      if(String(err.message||"").toLowerCase().includes("não autorizado")){
-        sessionStorage.removeItem("admin_token");
-        setToken("");
+      const j = await api("/api/admin/metrics");
+      setMetrics(j);
+    }catch(e){
+      setToast(e.message || "Erro ao carregar métricas");
+      const m = String(e.message || "").toLowerCase();
+      if(m.includes("não autorizado") || m.includes("sessão")){
+        logout();
       }
+    }finally{
+      setLoading(false);
     }
   }
 
   useEffect(()=>{
-    load();
-    // refresh automático a cada 3s
-    if(!token) return;
-    const t = setInterval(load, 3000);
+    if(!isAuthed){
+      setOpenLogin(true);
+      return;
+    }
+    loadMetrics();
+    const t = setInterval(loadMetrics, 2000);
     return ()=>clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token]);
+  }, [isAuthed]);
 
-  function logout(){
-    sessionStorage.removeItem("admin_token");
-    setToken("");
-    setState(null);
-    setToast("Logout.");
-  }
-
-  async function apiPost(url, body){
-    setBusy(true);
-    try{
-      const r = await fetch(url, {
-        method:"POST",
-        headers:{ "Content-Type":"application/json", ...authHeaders },
-        body: JSON.stringify(body || {})
-      });
-      const j = await r.json();
-      if(!j.ok) throw new Error(j.error || "Erro");
-      setToast("Ação aplicada.");
-      await load();
-    }catch(err){
-      setToast(err.message || "Erro");
-    }finally{
-      setBusy(false);
-    }
-  }
-
-  if(!token){
-    return (
-      <div className="shell">
-        <Toast msg={toast} onClose={()=>setToast("")} />
-        <header className="topbar">
-          <div className="brand">
-            <div className="logo">EP</div>
-            <div>
-              <div className="brand-title">Área Reservada</div>
-              <div className="brand-sub">Administração e moderação</div>
-            </div>
-          </div>
-        </header>
-
-        <main className="home">
-          <div className="card">
-            <h1>Login do Administrador</h1>
-            <p className="muted">Acesso restrito. Use a senha definida em <span className="pill mono">ADMIN_PASS</span>.</p>
-
-            <form className="form" onSubmit={login}>
-              <label>
-                Senha
-                <input value={pass} onChange={(e)=>setPass(e.target.value)} type="password" required minLength={3} placeholder="Digite a senha" />
-              </label>
-              <div className="row">
-                <button className="btn primary" disabled={busy} type="submit">
-                  {busy ? "Entrando..." : "Entrar"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </main>
-      </div>
-    );
-  }
+  const ram = metrics?.ram || {};
+  const uptimeSec = metrics?.uptimeSec || 0;
 
   return (
     <div className="shell">
       <Toast msg={toast} onClose={()=>setToast("")} />
 
       <header className="topbar">
-        <div className="brand">
+        <div className="brand clickable" onClick={()=>nav("/")}>
           <div className="logo">EP</div>
           <div>
             <div className="brand-title">Área Reservada</div>
-            <div className="brand-sub">Moderação: usuários, grupos e mensagens</div>
+            <div className="brand-sub">Dashboard (tempo real)</div>
           </div>
         </div>
 
         <div className="top-actions">
-          <button className="btn" onClick={load} disabled={busy}>Atualizar</button>
-          <button className="btn danger" onClick={logout}>Sair</button>
+          <button className="btn" onClick={loadMetrics} disabled={!isAuthed || loading}>
+            {loading ? "Atualizando..." : "Atualizar"}
+          </button>
+          <button className="btn danger" onClick={logout} disabled={!isAuthed}>
+            Sair do admin
+          </button>
         </div>
       </header>
 
-      <main className="chat" style={{ gridTemplateColumns: "1fr 1fr" }}>
-        {/* COLUNA 1 */}
-        <div className="chat-main" style={{ minHeight: "75vh" }}>
-          <div className="messages">
-            <div className="room-label">Controles</div>
+      <main className="admin-shell">
+        <div className="admin-hero">
+          <div>
+            <div className="admin-title">Visão geral</div>
+            <div className="admin-sub">
+              Desde o boot: <b>{metrics?.bootAt ? fmtSince(metrics.bootAt) : "—"}</b> • Uptime: <b>{uptimeSec}s</b> • Atualiza a cada 2s
+            </div>
+          </div>
+          <div className="admin-tools">
+            <span className="badge mono">Sessão: {exp ? fmtTime(exp) : "—"}</span>
+          </div>
+        </div>
 
-            <div className="card" style={{ marginTop: 10 }}>
-              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:10 }}>
-                <div>
-                  <div style={{ fontWeight: 900 }}>Criação de grupos</div>
-                  <div className="muted" style={{ marginTop: 4 }}>
-                    {state?.freezeGroups ? "BLOQUEADA (ninguém cria grupo)" : "LIBERADA"}
-                  </div>
-                </div>
-
-                <button
-                  className={"btn " + (state?.freezeGroups ? "primary" : "")}
-                  disabled={busy}
-                  onClick={() => apiPost("/api/admin/freeze-groups", { enabled: !state?.freezeGroups })}
-                >
-                  {state?.freezeGroups ? "Desbloquear" : "Bloquear"}
-                </button>
+        <div className="admin-grid">
+          <div className="admin-card">
+            <h2>Online agora</h2>
+            <div className="admin-row">
+              <div className="admin-badges">
+                <span className="badge good">Online: <b>{metrics?.onlineNow ?? "—"}</b></span>
+                <span className="badge">Salas: <b>{metrics?.roomsTotal ?? "—"}</b></span>
+                <span className="badge">Grupos: <b>{metrics?.groupsTotal ?? "—"}</b></span>
+                <span className="badge">DMs ativos: <b>{metrics?.dmActive ?? "—"}</b></span>
               </div>
             </div>
+            <div className="muted">Contagem do servidor atual (1 instância).</div>
+          </div>
 
-            <div className="room-label" style={{ marginTop: 18 }}>Usuários online</div>
-            {(state?.users || []).map(u => (
-              <div key={u.socketId} className="card" style={{ marginTop: 10 }}>
-                <div style={{ display:"flex", justifyContent:"space-between", gap:10, alignItems:"center" }}>
-                  <div>
-                    <div style={{ fontWeight: 900 }}>{u.nick}</div>
-                    <div className="muted" style={{ marginTop: 4 }}>
-                      Sala: <span className="pill mono">{u.roomId}</span> · IP: <span className="pill mono">{u.ip}</span>
-                    </div>
-                    <div className="muted" style={{ marginTop: 4 }}>Entrou: {fmtDate(u.joinedAt)}</div>
-                  </div>
-
-                  <div style={{ display:"grid", gap:8 }}>
-                    <button
-                      className="btn"
-                      disabled={busy}
-                      onClick={() => {
-                        const msg = prompt("Mensagem para o usuário (aviso):", "Atenção: por favor respeite as regras.");
-                        if (!msg) return;
-                        apiPost("/api/admin/warn", { socketId: u.socketId, message: msg });
-                      }}
-                    >
-                      Avisar
-                    </button>
-
-                    <button
-                      className="btn danger"
-                      disabled={busy}
-                      onClick={() => apiPost("/api/admin/kick", { socketId: u.socketId })}
-                    >
-                      Kick
-                    </button>
-
-                    <button
-                      className="btn"
-                      disabled={busy}
-                      onClick={() => {
-                        const minutes = Number(prompt("Banir por quantos minutos? (0 = até reiniciar)", "60") || "0");
-                        const reason = prompt("Motivo:", "Moderação") || "Moderação";
-                        apiPost("/api/admin/ban-ip", { ip: u.ip, minutes, reason });
-                      }}
-                    >
-                      Ban IP
-                    </button>
-                  </div>
-                </div>
+          <div className="admin-card">
+            <h2>Picos</h2>
+            <div className="admin-row">
+              <div className="admin-badges">
+                <span className="badge warn">Pico online: <b>{metrics?.peakOnline ?? "—"}</b></span>
+                <span className="badge mono">Quando: {metrics?.peakOnlineAt ? fmtTime(metrics.peakOnlineAt) : "—"}</span>
               </div>
-            ))}
+            </div>
+            <div className="muted">Sem persistência: reiniciou, zera.</div>
+          </div>
 
-            {(!state?.users || state.users.length === 0) && (
-              <div className="muted" style={{ marginTop: 10 }}>Nenhum usuário online.</div>
-            )}
-
-            <div className="room-label" style={{ marginTop: 18 }}>Bans</div>
-            {(state?.bans || []).map(b => (
-              <div key={b.ip} className="card" style={{ marginTop: 10 }}>
-                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:10 }}>
-                  <div>
-                    <div style={{ fontWeight: 900 }} className="mono">{b.ip}</div>
-                    <div className="muted" style={{ marginTop: 4 }}>
-                      Até: {b.until ? fmtDate(b.until) : "reinício do servidor"} · Motivo: {b.reason || "-"}
-                    </div>
-                  </div>
-                  <button className="btn" disabled={busy} onClick={() => apiPost("/api/admin/unban-ip", { ip: b.ip })}>
-                    Remover ban
-                  </button>
-                </div>
+          <div className="admin-card">
+            <h2>Tempo médio de sessão</h2>
+            <div className="admin-row">
+              <div className="admin-badges">
+                <span className="badge good">Online agora: <b>{metrics ? fmtDur(metrics.avgSessionNowMs || 0) : "—"}</b></span>
+                <span className="badge">Histórico (boot): <b>{metrics ? fmtDur(metrics.avgSessionAllMs || 0) : "—"}</b></span>
+                <span className="badge mono">Sessões encerradas: <b>{metrics?.sessionsClosedCount ?? "—"}</b></span>
               </div>
-            ))}
-            {(!state?.bans || state.bans.length === 0) && (
-              <div className="muted" style={{ marginTop: 10 }}>Nenhum IP banido.</div>
-            )}
+            </div>
+            <div className="muted">Histórico inclui sessões encerradas + ativas (desde o boot).</div>
+          </div>
+
+          <div className="admin-card">
+            <h2>Mensagens por minuto</h2>
+            <div className="admin-row">
+              <div className="admin-badges">
+                <span className="badge good">Agora (últimos 60s): <b>{metrics?.msgsPerMinNow ?? "—"}</b></span>
+                <span className="badge warn">Pico: <b>{metrics?.peakMsgsPerMin ?? "—"}</b></span>
+                <span className="badge mono">Quando: {metrics?.peakMsgsPerMinAt ? fmtTime(metrics.peakMsgsPerMinAt) : "—"}</span>
+              </div>
+            </div>
+            <div className="muted">Conta mensagens do Geral + Grupos + DMs.</div>
+          </div>
+
+          <div className="admin-card">
+            <h2>Consumo de memória (RAM)</h2>
+            <div className="admin-row">
+              <div className="admin-badges">
+                <span className="badge">RSS: <b>{fmtBytes(ram.rss)}</b></span>
+                <span className="badge">Heap usado: <b>{fmtBytes(ram.heapUsed)}</b></span>
+                <span className="badge">Heap total: <b>{fmtBytes(ram.heapTotal)}</b></span>
+                <span className="badge">External: <b>{fmtBytes(ram.external)}</b></span>
+              </div>
+            </div>
+            <div className="muted">RSS é o mais importante (memória total do processo).</div>
+          </div>
+
+          <div className="admin-card">
+            <h2>Dica</h2>
+            <div className="muted">
+              Se você quiser, no próximo passo eu separo “mensagens por minuto” por sala (Geral / cada Grupo / DMs),
+              mantendo ainda tudo sem banco.
+            </div>
           </div>
         </div>
 
-        {/* COLUNA 2 */}
-        <div className="chat-main" style={{ minHeight: "75vh" }}>
-          <div className="messages">
-            <div className="room-label">Salas (Geral / Grupos)</div>
+        <div className="admin-card">
+          <h2>Online por sala (agora + pico)</h2>
 
-            {(state?.rooms || [])
-              .filter(r => r.type === "public" || r.type === "group")
-              .map(r => (
-                <div key={r.id} className="card" style={{ marginTop: 10 }}>
-                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:10 }}>
-                    <div>
-                      <div style={{ fontWeight: 900 }}>
-                        {r.type === "public" ? "Geral" : (r.name || "Grupo")}
-                      </div>
-                      <div className="muted" style={{ marginTop: 4 }}>
-                        ID: <span className="pill mono">{r.id}</span> · Online: <b>{r.onlineCount}</b> · Msg: <b>{r.msgCount}</b>
-                      </div>
-                      <div className="muted" style={{ marginTop: 4 }}>Criado: {fmtDate(r.createdAt)}</div>
-                    </div>
-
-                    <button className="btn danger" disabled={busy} onClick={() => apiPost("/api/admin/clear-room", { roomId: r.id })}>
-                      Limpar
-                    </button>
-                  </div>
-
-                  <details style={{ marginTop: 10 }}>
-                    <summary className="btn" style={{ width:"fit-content" }}>Ver mensagens</summary>
-                    <div style={{ marginTop: 10, display:"grid", gap:8 }}>
-                      {(state?.messages?.[r.id] || []).slice(-80).map(m => (
-                        <div key={m.id} className="bubble" style={{ maxWidth:"100%" }}>
-                          <div style={{ display:"flex", justifyContent:"space-between", gap:8 }}>
-                            <b>{m.nick}</b>
-                            <span className="muted" style={{ fontSize:12 }}>{fmtDate(m.ts)}</span>
-                          </div>
-                          {m.replyTo && (
-                            <div className="pill mono" style={{ marginTop: 8, display:"inline-block" }}>
-                              Respondendo {m.replyTo.nick}: {m.replyTo.preview}
-                            </div>
-                          )}
-                          <div style={{ marginTop: 8 }}>
-                            {m.type === "text" ? m.content : (m.type === "image" ? "[imagem]" : "[áudio]")}
-                          </div>
-                        </div>
-                      ))}
-                      {(state?.messages?.[r.id] || []).length === 0 && <div className="muted">Sem mensagens.</div>}
-                    </div>
-                  </details>
-                </div>
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th>Tipo</th>
+                <th>Sala</th>
+                <th>ID</th>
+                <th>Online agora</th>
+                <th>Pico sala</th>
+                <th>Quando</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(metrics?.byRoom || []).map(r => (
+                <tr key={r.id}>
+                  <td>
+                    <span className={"badge " + (r.type==="group" ? "warn" : r.type==="dm" ? "danger" : "good")}>
+                      {r.type==="public" ? "Pública" : r.type==="group" ? "Grupo" : "DM"}
+                    </span>
+                  </td>
+                  <td style={{ fontWeight: 900 }}>{r.name}</td>
+                  <td className="mono">{r.id}</td>
+                  <td><b>{r.onlineNow}</b></td>
+                  <td>{r.peakOnline}</td>
+                  <td className="mono">{r.peakOnlineAt ? fmtTime(r.peakOnlineAt) : "—"}</td>
+                </tr>
               ))}
-
-            <div className="room-label" style={{ marginTop: 18 }}>DMs (metadados)</div>
-            {(state?.dms || []).map(dm => (
-              <div key={dm.id} className="card" style={{ marginTop: 10 }}>
-                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:10 }}>
-                  <div>
-                    <div style={{ fontWeight: 900 }}>DM</div>
-                    <div className="muted" style={{ marginTop: 4 }}>
-                      Participantes: {(dm.participants || []).map(p => p.nick).join(" ↔ ") || "—"}
-                    </div>
-                    <div className="muted" style={{ marginTop: 4 }}>
-                      Msg: <b>{dm.msgCount}</b> · Online na DM: <b>{dm.onlineCount}</b> · Criado: {fmtDate(dm.createdAt)}
-                    </div>
-                  </div>
-
-                  <button className="btn danger" disabled={busy} onClick={() => apiPost("/api/admin/close-dm", { dmId: dm.id })}>
-                    Encerrar DM
-                  </button>
-                </div>
-              </div>
-            ))}
-
-            {(!state?.dms || state.dms.length === 0) && (
-              <div className="muted" style={{ marginTop: 10 }}>Nenhum DM ativo.</div>
-            )}
-          </div>
+              {(!metrics?.byRoom || metrics.byRoom.length===0) && (
+                <tr><td colSpan="6" className="muted">Sem dados ainda.</td></tr>
+              )}
+            </tbody>
+          </table>
         </div>
       </main>
+
+      <Modal open={openLogin} title="Acesso restrito">
+        <form onSubmit={login} className="form">
+          <label>
+            Senha do administrador
+            <input
+              type="password"
+              value={pass}
+              onChange={(e)=>setPass(e.target.value)}
+              placeholder="Digite a senha"
+              required
+              minLength={4}
+            />
+          </label>
+          <div className="row">
+            <button type="button" className="btn" onClick={()=>nav("/")}>Voltar</button>
+            <button className="btn primary" type="submit">Entrar</button>
+          </div>
+          <div className="muted" style={{ marginTop: 8 }}>
+            Dica: configure <span className="pill mono">ADMIN_PASS</span> no Render.
+          </div>
+        </form>
+      </Modal>
     </div>
   );
 }
