@@ -44,7 +44,6 @@ export default function Room({ mode }){
 
   const inviteLink = useMemo(()=>{
     if(mode !== "group") return "";
-    // com HashRouter, isso funciona:
     return `${location.origin}/#/g/${roomId}`;
   }, [mode, roomId]);
 
@@ -58,6 +57,19 @@ export default function Room({ mode }){
     const el = dmListRef.current;
     if(!el) return;
     el.scrollTop = el.scrollHeight;
+  }
+
+  function safeExit(reason){
+    // Fecha tudo, mostra aviso e sai pro início
+    try{
+      socket.disconnect();
+    }catch{}
+    setDmOpen(false);
+    setReply(null);
+    setPicker(null);
+    setOpenAuth(true);
+    if(reason) setToast(reason);
+    setTimeout(()=>nav("/"), 350);
   }
 
   useEffect(()=>{
@@ -99,6 +111,22 @@ export default function Room({ mode }){
       setUsersOnline(payload.users || []);
     }
 
+    // ✅ Aviso do admin (toast na tela)
+    function onAdminNotice(payload){
+      const msg = String(payload?.message || "").trim();
+      if(msg) setToast(`⚠️ Aviso: ${msg}`);
+    }
+
+    // ✅ Kick / Ban (sai do chat)
+    function onAdminKick(payload){
+      const msg = String(payload?.message || "Você foi removido pelo administrador.").trim();
+      safeExit(msg);
+    }
+    function onAdminBan(payload){
+      const msg = String(payload?.message || "Seu acesso foi bloqueado.").trim();
+      safeExit(msg);
+    }
+
     // DM handlers
     function onDmReady({ dmId, peer }){
       setDmId(dmId);
@@ -132,6 +160,12 @@ export default function Room({ mode }){
     socket.on("error_toast", onErr);
 
     socket.on("users_list", onUsersList);
+
+    // ✅ Admin
+    socket.on("admin_notice", onAdminNotice);
+    socket.on("admin_kick", onAdminKick);
+    socket.on("admin_ban", onAdminBan);
+
     socket.on("dm_ready", onDmReady);
     socket.on("dm_snapshot", onDmSnap);
     socket.on("dm_new_message", onDmNew);
@@ -146,6 +180,11 @@ export default function Room({ mode }){
       socket.off("error_toast", onErr);
 
       socket.off("users_list", onUsersList);
+
+      socket.off("admin_notice", onAdminNotice);
+      socket.off("admin_kick", onAdminKick);
+      socket.off("admin_ban", onAdminBan);
+
       socket.off("dm_ready", onDmReady);
       socket.off("dm_snapshot", onDmSnap);
       socket.off("dm_new_message", onDmNew);
@@ -154,8 +193,7 @@ export default function Room({ mode }){
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
 
-  // Se entrar em grupo e senha estiver errada, o backend manda toast, mas o modal já pode ter fechado.
-  // Aqui reabre o modal se não veio snapshot.
+  // Se entrar em grupo e senha estiver errada, reabre o modal se não veio snapshot.
   useEffect(()=>{
     if(openAuth) return;
     const t = setTimeout(()=>{
