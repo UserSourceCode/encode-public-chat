@@ -61,6 +61,7 @@ export default function Home(){
             <div className="home-sub">Chat Público + Grupos Privados (sem salvar nada)</div>
           </div>
         </div>
+         </div> 
 
       <div className="home-container">
         <div className="home-card">
