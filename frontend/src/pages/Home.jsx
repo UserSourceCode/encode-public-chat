@@ -31,14 +31,14 @@ export default function Home(){
       });
 
       const j = await r.json().catch(()=>null);
-      if(!j?.ok) return alert(j?.error || "Erro ao criar grupo");
+      if(!r.ok || !j?.ok) return alert(j?.error || "Erro ao criar grupo");
 
-      // ✅ salva a chave do criador para este grupo
-      if(j.adminKey && j.groupId){
-        sessionStorage.setItem(`group_admin_key:${j.groupId}`, String(j.adminKey));
-      }
-
-      nav(`/g/${j.groupId}?nick=${encodeURIComponent(nick.trim())}&pass=${encodeURIComponent(groupPass)}`);
+      // IMPORTANTÍSSIMO: ownerToken define o criador como admin do grupo
+      nav(
+        `/g/${encodeURIComponent(j.groupId)}?nick=${encodeURIComponent(nick.trim())}` +
+        `&pass=${encodeURIComponent(groupPass)}` +
+        `&owner=${encodeURIComponent(j.ownerToken)}`
+      );
     }catch{
       alert("Falha ao criar grupo.");
     }
@@ -60,7 +60,11 @@ export default function Home(){
 
   return (
     <div className="home-wrap">
-      <div className="home-hero">
+      <div className="bg-orb orb-a" />
+      <div className="bg-orb orb-b" />
+      <div className="bg-noise" />
+
+      <header className="home-top">
         <div className="home-brand">
           <div className="home-logo">EP</div>
           <div>
@@ -68,23 +72,43 @@ export default function Home(){
             <div className="home-sub">Chat Público + Grupos Privados (sem salvar nada)</div>
           </div>
         </div>
-      </div>
 
-      <div className="home-container">
-        <div className="home-card">
-          <h1>Entrar no chat</h1>
-          <p className="muted" style={{ marginTop: 6 }}>
-            Tudo é temporário: mensagens ficam apenas em RAM enquanto há usuários conectados.
-          </p>
+        <div className="home-top-actions">
+          <button className="btn" type="button" onClick={()=>nav("/area-reservada")}>
+            Área reservada
+          </button>
+        </div>
+      </header>
+
+      <main className="home-container">
+        <section className="home-card">
+          <div className="home-card-head">
+            <h1>Entrar no chat</h1>
+            <p className="muted" style={{ marginTop: 6 }}>
+              Tudo é temporário: mensagens ficam apenas em RAM enquanto há usuários conectados.
+            </p>
+          </div>
 
           <div className="home-tabs">
-            <button className={"home-tab " + (tab==="geral" ? "active" : "")} onClick={()=>setTab("geral")} type="button">
+            <button
+              className={"home-tab " + (tab==="geral" ? "active" : "")}
+              onClick={()=>setTab("geral")}
+              type="button"
+            >
               Geral
             </button>
-            <button className={"home-tab " + (tab==="criar" ? "active" : "")} onClick={()=>setTab("criar")} type="button">
+            <button
+              className={"home-tab " + (tab==="criar" ? "active" : "")}
+              onClick={()=>setTab("criar")}
+              type="button"
+            >
               Criar grupo
             </button>
-            <button className={"home-tab " + (tab==="entrar" ? "active" : "")} onClick={()=>setTab("entrar")} type="button">
+            <button
+              className={"home-tab " + (tab==="entrar" ? "active" : "")}
+              onClick={()=>setTab("entrar")}
+              type="button"
+            >
               Entrar em grupo
             </button>
           </div>
@@ -106,7 +130,7 @@ export default function Home(){
             {tab === "geral" && (
               <form onSubmit={enterPublic} className="home-form">
                 <div className="home-tip">
-                  Você entra com <span className="pill mono">apelido</span> e conversa no <b>Geral</b>.
+                  Você entra com <span className="pill mono">apelido</span> e começa a conversar no <b>Geral</b>.
                 </div>
                 <button className="btn primary" disabled={!canNick} type="submit">
                   Entrar no Geral
@@ -142,14 +166,19 @@ export default function Home(){
                 </label>
 
                 <div className="home-tip">
-                  Um ID será gerado para o grupo. O grupo existe enquanto houver gente conectada.
+                  Um ID será gerado para o grupo. Ele existe enquanto houver gente conectada.
                   <br/>
-                  <b>Quem cria vira admin</b> (somente dentro do grupo).
+                  O criador vira <b>admin do grupo</b> automaticamente.
                 </div>
 
-                <button className="btn primary" disabled={!canNick || groupPass.length < 3} type="submit">
-                  Criar e entrar
-                </button>
+                <div className="row">
+                  <button className="btn" type="button" onClick={()=>{ setGroupName("Grupo"); setGroupPass(""); }}>
+                    Limpar
+                  </button>
+                  <button className="btn primary" disabled={!canNick || groupPass.length < 3} type="submit">
+                    Criar e entrar
+                  </button>
+                </div>
               </form>
             )}
 
@@ -185,11 +214,34 @@ export default function Home(){
             )}
           </div>
 
-          <div className="home-foot muted">
-            Encode ProTech • Sem persistência • Pronto para Render
+          <div className="home-foot">
+            <span className="muted">Encode ProTech</span>
+            <span className="dot" />
+            <span className="muted">Sem persistência</span>
+            <span className="dot" />
+            <span className="muted">Pronto para Render</span>
           </div>
-        </div>
-      </div>
+        </section>
+
+        <aside className="home-aside">
+          <div className="aside-card">
+            <div className="aside-title">Como funciona</div>
+            <div className="aside-list">
+              <div className="aside-item"><b>Geral</b> é público e não tem admin.</div>
+              <div className="aside-item"><b>Grupos</b> são privados e têm senha.</div>
+              <div className="aside-item">Quem cria o grupo vira <b>admin do grupo</b>.</div>
+              <div className="aside-item">Mensagens/imagens/áudios ficam só em <b>RAM</b>.</div>
+            </div>
+          </div>
+
+          <div className="aside-card">
+            <div className="aside-title">Dica rápida</div>
+            <div className="muted">
+              Se aparecer “grupo não existe”, é porque ele ficou vazio e o servidor limpou a sala.
+            </div>
+          </div>
+        </aside>
+      </main>
     </div>
   );
 }

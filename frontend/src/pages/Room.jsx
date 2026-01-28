@@ -6,211 +6,341 @@ import Toast from "../ui/Toast.jsx";
 
 function useQuery(){
   const { search } = useLocation();
-  return useMemo(() => new URLSearchParams(search), [search]);
+  return useMemo(()=>new URLSearchParams(search), [search]);
 }
 
-function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
+function fmtTime(ts){
+  try{
+    return new Date(ts).toLocaleTimeString("pt-BR", { hour:"2-digit", minute:"2-digit" });
+  }catch{ return ""; }
+}
+
+function safeNick(n){
+  return String(n || "").trim().slice(0, 18);
+}
 
 export default function Room(){
   const nav = useNavigate();
   const params = useParams();
   const q = useQuery();
 
-  const isGeneral = useMemo(() => {
-    // rota /geral
-    return window.location.hash.includes("/geral") || window.location.pathname.includes("/geral");
-  }, []);
+  const pathname = useLocation().pathname;
+  const isGroupRoute = pathname.startsWith("/g/");
+  const roomId = isGroupRoute ? params.id : "geral";
 
-  const roomId = useMemo(() => (params.roomId || "geral"), [params.roomId]);
-  const nick = useMemo(() => String(q.get("nick") || "").trim(), [q]);
-  const pass = useMemo(() => String(q.get("pass") || ""), [q]);
+  const nick = safeNick(q.get("nick"));
+  const pass = q.get("pass") || "";
+  const owner = q.get("owner") || "";
 
   const [toast, setToast] = useState("");
   const [connected, setConnected] = useState(false);
 
-  // chat
+  const [room, setRoom] = useState(null);
+  const [msgs, setMsgs] = useState([]);
+  const [frozen, setFrozen] = useState(false);
+
+  const [users, setUsers] = useState([]); // {socketId,nick}
+  const [admins, setAdmins] = useState([]); // socketIds
+  const [isGroupAdmin, setIsGroupAdmin] = useState(false);
+
   const [text, setText] = useState("");
-  const [messages, setMessages] = useState([]);
+  const [sending, setSending] = useState(false);
 
-  // users
-  const [usersList, setUsersList] = useState([]); // [{socketId,nick,role?}]
-  const [myRole, setMyRole] = useState("member"); // member | admin (apenas em grupo)
-
-  // modal usuário (admin do grupo)
-  const [userModal, setUserModal] = useState(false);
-  const [selectedUser, setSelectedUser] = useState(null);
+  // modal admin do grupo
+  const [openAdmin, setOpenAdmin] = useState(false);
+  const [openUserModal, setOpenUserModal] = useState(false);
+  const [target, setTarget] = useState(null); // {socketId,nick}
+  const [action, setAction] = useState("warn"); // warn|kick|ban|promote|demote
+  const [actionMsg, setActionMsg] = useState("");
   const [banMinutes, setBanMinutes] = useState(60);
-  const [banReason, setBanReason] = useState("Acesso bloqueado pelo admin do grupo.");
-  const [warnMsg, setWarnMsg] = useState("Por favor, mantenha o respeito e siga as regras.");
 
+  // upload (imagem/audio)
+  const fileInputRef = useRef(null);
+  const audioInputRef = useRef(null);
+
+  // recorder simples
+  const recRef = useRef(null);
+  const chunksRef = useRef([]);
+  const [recOn, setRecOn] = useState(false);
+
+  const listEndRef = useRef(null);
+
+  // socket
   const sockRef = useRef(null);
 
-  useEffect(() => {
-    // validação simples
+  useEffect(()=>{
+    // valida login mínimo
     if(!nick || nick.length < 2){
-      setToast("Informe um apelido válido.");
       nav("/");
       return;
     }
-    if(!isGeneral && (!roomId || !pass)){
-      setToast("Grupo requer senha.");
+    if(isGroupRoute && (!roomId || !pass)){
       nav("/");
       return;
     }
 
-    const socket = io("/", { transports: ["websocket"] });
+    const socket = io("/", { transports: ["websocket", "polling"] });
     sockRef.current = socket;
 
-    socket.on("connect", () => {
+    function toastErr(m){ setToast(m || "Erro"); }
+    function toastOk(m){ setToast(m || "OK"); }
+
+    socket.on("connect", ()=>{
       setConnected(true);
 
-      if(isGeneral){
-        // ✅ Geral não tem admin. Role sempre member.
-        socket.emit("join_public", { nick });
-        setMyRole("member");
+      if(isGroupRoute){
+        socket.emit("join_group", { roomId, nick, password: pass, ownerToken: owner });
       }else{
-        const adminKey = sessionStorage.getItem(`group_admin_key:${roomId}`) || "";
-        socket.emit("join_group", {
-          roomId,
-          nick,
-          password: pass,
-          adminKey: adminKey || undefined
-        });
+        socket.emit("join_public", { nick });
       }
     });
 
-    socket.on("disconnect", () => {
+    socket.on("disconnect", ()=>{
       setConnected(false);
     });
 
-    // mensagens
-    socket.on("message", (msg) => {
-      setMessages(prev => [...prev, msg]);
+    socket.on("error_toast", (p)=>toastErr(p?.message));
+    socket.on("ok_toast", (p)=>toastOk(p?.message));
+
+    socket.on("room_snapshot", (snap)=>{
+      setRoom(snap?.room || null);
+      setMsgs(Array.isArray(snap?.messages) ? snap.messages : []);
+      setTimeout(()=>listEndRef.current?.scrollIntoView({ behavior:"instant" }), 0);
     });
 
-    socket.on("room_snapshot", (snap) => {
-      // snap.messages opcional
-      if(Array.isArray(snap?.messages)){
-        setMessages(snap.messages);
-      }
-      if(Array.isArray(snap?.users)){
-        setUsersList(snap.users);
-      }
+    socket.on("message_new", (m)=>{
+      setMsgs(prev => {
+        const next = [...prev, m];
+        return next.slice(-320);
+      });
+      setTimeout(()=>listEndRef.current?.scrollIntoView({ behavior:"smooth" }), 0);
     });
 
-    socket.on("users_list", ({ users }) => {
-      setUsersList(Array.isArray(users) ? users : []);
+    socket.on("message_deleted", ({ ids })=>{
+      if(!Array.isArray(ids) || !ids.length) return;
+      setMsgs(prev => prev.filter(x => !ids.includes(x.id)));
     });
 
-    // ✅ papel do usuário em grupos
-    socket.on("you_role", ({ role }) => {
-      if(!isGeneral){
-        setMyRole(role || "member");
-      }else{
-        setMyRole("member");
-      }
+    socket.on("room_frozen", ({ roomId: rid, frozen })=>{
+      if(rid === roomId) setFrozen(Boolean(frozen));
     });
 
-    // avisos privados/ações
-    socket.on("error_toast", ({ message }) => setToast(message || "Erro"));
-    socket.on("private_warn", ({ message }) => setToast(message || "Aviso do admin"));
-    socket.on("admin_notice", ({ message }) => setToast(message || "Aviso"));
-    socket.on("admin_kick", ({ message }) => {
+    socket.on("users_list", ({ users })=>{
+      setUsers(Array.isArray(users) ? users : []);
+    });
+
+    socket.on("group_admins", ({ admins })=>{
+      setAdmins(Array.isArray(admins) ? admins : []);
+    });
+
+    socket.on("group_you_are_admin", ({ ok })=>{
+      setIsGroupAdmin(Boolean(ok));
+    });
+
+    socket.on("admin_notice", ({ message })=>{
+      setToast(message || "Aviso do administrador");
+    });
+
+    socket.on("admin_kick", ({ message })=>{
       setToast(message || "Você foi removido.");
+      setTimeout(()=>nav("/"), 400);
+    });
+
+    socket.on("admin_ban", ({ message })=>{
+      setToast(message || "Você foi banido.");
       setTimeout(()=>nav("/"), 500);
     });
-    socket.on("admin_ban", ({ message }) => {
-      setToast(message || "Você foi banido.");
-      setTimeout(()=>nav("/"), 600);
-    });
 
-    return () => {
-      try{
-        socket.disconnect();
-      }catch{}
+    return ()=>{
+      try{ socket.disconnect(); }catch{}
       sockRef.current = null;
     };
-  }, [nick, pass, roomId, isGeneral, nav]);
-
-  const canSend = useMemo(() => text.trim().length > 0, [text]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId]);
 
   function sendText(e){
     e?.preventDefault?.();
-    const socket = sockRef.current;
-    if(!socket || !connected) return;
-
-    const t = text.trim();
+    if(frozen) return setToast("Sala congelada. Não é possível enviar.");
+    const s = sockRef.current;
+    if(!s) return;
+    const t = String(text || "").trim();
     if(!t) return;
+    setSending(true);
+    s.emit("send_message", { type:"text", content: t, roomId });
+    setText("");
+    setTimeout(()=>setSending(false), 120);
+  }
 
-    // ✅ respeita seu backend: em geral -> send_public, em grupo -> send_group
-    if(isGeneral){
-      socket.emit("send_public", { text: t });
+  async function fileToDataUrl(file){
+    return new Promise((resolve, reject)=>{
+      const r = new FileReader();
+      r.onload = ()=>resolve(String(r.result || ""));
+      r.onerror = reject;
+      r.readAsDataURL(file);
+    });
+  }
+
+  async function pickImage(){
+    if(frozen) return setToast("Sala congelada. Não é possível enviar.");
+    fileInputRef.current?.click();
+  }
+
+  async function onPickImage(e){
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if(!file) return;
+
+    if(file.size > 2.2 * 1024 * 1024){
+      setToast("Imagem muito grande (máx ~2MB).");
+      return;
+    }
+    const s = sockRef.current;
+    if(!s) return;
+
+    setSending(true);
+    try{
+      const dataUrl = await fileToDataUrl(file);
+      s.emit("send_message", { type:"image", content: dataUrl, roomId });
+    }catch{
+      setToast("Falha ao enviar imagem.");
+    }finally{
+      setTimeout(()=>setSending(false), 120);
+    }
+  }
+
+  async function pickAudio(){
+    if(frozen) return setToast("Sala congelada. Não é possível enviar.");
+    // se o browser suportar gravação, preferir recorder
+    if(navigator.mediaDevices?.getUserMedia){
+      if(recOn){
+        // parar gravação
+        try{
+          recRef.current?.stop();
+        }catch{}
+        return;
+      }
+      try{
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const rec = new MediaRecorder(stream, { mimeType: "audio/webm" });
+        recRef.current = rec;
+        chunksRef.current = [];
+        rec.ondataavailable = (ev)=>{
+          if(ev.data && ev.data.size > 0) chunksRef.current.push(ev.data);
+        };
+        rec.onstop = async ()=>{
+          setRecOn(false);
+          try{
+            stream.getTracks().forEach(t=>t.stop());
+          }catch{}
+          const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+          if(blob.size > 2.2 * 1024 * 1024){
+            setToast("Áudio muito grande (tente menor).");
+            return;
+          }
+          const s = sockRef.current;
+          if(!s) return;
+          const dataUrl = await fileToDataUrl(blob);
+          setSending(true);
+          s.emit("send_message", { type:"audio", content: dataUrl, roomId });
+          setTimeout(()=>setSending(false), 120);
+        };
+        rec.start();
+        setRecOn(true);
+        setToast("Gravando áudio... clique novamente para parar.");
+      }catch{
+        // fallback para upload
+        audioInputRef.current?.click();
+      }
     }else{
-      socket.emit("send_group", { roomId, text: t });
+      audioInputRef.current?.click();
+    }
+  }
+
+  async function onPickAudio(e){
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if(!file) return;
+
+    if(file.size > 2.2 * 1024 * 1024){
+      setToast("Áudio muito grande (máx ~2MB).");
+      return;
+    }
+    const s = sockRef.current;
+    if(!s) return;
+
+    setSending(true);
+    try{
+      const dataUrl = await fileToDataUrl(file);
+      s.emit("send_message", { type:"audio", content: dataUrl, roomId });
+    }catch{
+      setToast("Falha ao enviar áudio.");
+    }finally{
+      setTimeout(()=>setSending(false), 120);
+    }
+  }
+
+  function openAdminPanel(){
+    if(!isGroupRoute) return setToast("No Geral não existe admin.");
+    if(!isGroupAdmin) return setToast("Você não é admin deste grupo.");
+    setOpenAdmin(true);
+
+    const s = sockRef.current;
+    if(s) s.emit("group_admin_list");
+  }
+
+  function selectUser(u){
+    setTarget(u);
+    setAction("warn");
+    setActionMsg("Por favor, mantenha o respeito e siga as regras.");
+    setBanMinutes(60);
+    setOpenUserModal(true);
+  }
+
+  function runUserAction(e){
+    e?.preventDefault?.();
+    if(!target?.socketId) return;
+
+    const s = sockRef.current;
+    if(!s) return;
+
+    // promove/demote pode sem msg
+    const payload = {
+      action,
+      targetSocketId: target.socketId,
+      message: actionMsg,
+      minutes: banMinutes,
+    };
+
+    // ajustes
+    if(action === "kick"){
+      payload.message = actionMsg || "Você foi removido pelo admin do grupo.";
+    }
+    if(action === "ban"){
+      payload.message = actionMsg || "Você foi banido deste grupo.";
+      payload.minutes = Number(banMinutes || 0);
+    }
+    if(action === "promote"){
+      payload.message = "";
+      payload.minutes = 0;
+    }
+    if(action === "demote"){
+      payload.message = "";
+      payload.minutes = 0;
     }
 
-    setText("");
+    s.emit("group_admin_action", payload);
+    setOpenUserModal(false);
+
+    // recarregar lista para refletir admin/promote
+    setTimeout(()=>s.emit("group_admin_list"), 200);
   }
 
-  function openUserActions(u){
-    if(isGeneral) return;          // ✅ geral sem admin
-    if(myRole !== "admin") return; // ✅ só admin abre
-    setSelectedUser(u);
-    setBanMinutes(60);
-    setBanReason("Acesso bloqueado pelo admin do grupo.");
-    setWarnMsg("Por favor, mantenha o respeito e siga as regras.");
-    setUserModal(true);
-  }
+  const title = useMemo(()=>{
+    if(!room) return "Carregando…";
+    return room.type === "group" ? `Grupo • ${room.name}` : "Geral";
+  }, [room]);
 
-  function promoteAdmin(){
-    const socket = sockRef.current;
-    if(!socket || !selectedUser?.socketId) return;
-    if(!window.confirm(`Promover ${selectedUser.nick} a admin do grupo?`)) return;
-    socket.emit("group_promote_admin", { targetSocketId: selectedUser.socketId });
-    setUserModal(false);
-  }
-
-  function demoteAdmin(){
-    const socket = sockRef.current;
-    if(!socket || !selectedUser?.socketId) return;
-    if(!window.confirm(`Demover ${selectedUser.nick} (tirar admin)?`)) return;
-    socket.emit("group_demote_admin", { targetSocketId: selectedUser.socketId });
-    setUserModal(false);
-  }
-
-  function kickUser(){
-    const socket = sockRef.current;
-    if(!socket || !selectedUser?.socketId) return;
-    if(!window.confirm(`Remover ${selectedUser.nick} do grupo (kick)?`)) return;
-    socket.emit("group_kick", {
-      targetSocketId: selectedUser.socketId,
-      message: "Você foi removido pelo administrador do grupo."
-    });
-    setUserModal(false);
-  }
-
-  function warnUser(){
-    const socket = sockRef.current;
-    if(!socket || !selectedUser?.socketId) return;
-    socket.emit("group_warn", {
-      targetSocketId: selectedUser.socketId,
-      message: String(warnMsg || "").slice(0, 220)
-    });
-    setToast("Aviso enviado (privado).");
-    setUserModal(false);
-  }
-
-  function banIp(){
-    const socket = sockRef.current;
-    if(!socket || !selectedUser?.socketId) return;
-    if(!window.confirm(`Banir ${selectedUser.nick} do grupo?`)) return;
-    socket.emit("group_ban_ip", {
-      targetSocketId: selectedUser.socketId,
-      minutes: Number(banMinutes || 0),
-      reason: String(banReason || "").slice(0, 220)
-    });
-    setUserModal(false);
-  }
+  const youAreAdminLabel = isGroupRoute && isGroupAdmin;
 
   return (
     <div className="shell">
@@ -220,187 +350,220 @@ export default function Room(){
         <div className="brand clickable" onClick={()=>nav("/")}>
           <div className="logo">EP</div>
           <div>
-            <div className="brand-title">
-              {isGeneral ? "Geral" : "Grupo"}
-            </div>
+            <div className="brand-title">{title}</div>
             <div className="brand-sub">
-              {isGeneral ? "Chat Público" : `Sala: ${roomId}`} • {connected ? "online" : "offline"}
-              {!isGeneral && myRole === "admin" ? " • você é admin" : ""}
+              {connected ? "Conectado" : "Conectando…"}
+              {frozen ? " • Sala congelada" : ""}
+              {youAreAdminLabel ? " • Você é admin do grupo" : ""}
             </div>
           </div>
         </div>
 
         <div className="top-actions">
-          {!isGeneral && myRole === "admin" && (
-            <span className="badge good">Admin do grupo</span>
+          {isGroupRoute && (
+            <button className={"btn " + (youAreAdminLabel ? "primary" : "")} type="button" onClick={openAdminPanel}>
+              Admin do grupo
+            </button>
           )}
-          <button className="btn" onClick={()=>nav("/")}>Sair</button>
+          <button className="btn danger" type="button" onClick={()=>nav("/")}>
+            Sair
+          </button>
         </div>
       </header>
 
-      <main className="chat-shell">
-        <div className="chat-left">
-          <div className="chat-card">
+      <main className="room-shell">
+        <section className="chat-card">
+          <div className="chat-head">
             <div className="chat-title">Mensagens</div>
-
-            <div className="chat-messages">
-              {messages.length === 0 && <div className="muted">Sem mensagens ainda.</div>}
-
-              {messages.map((m, idx)=>(
-                <div key={idx} className="msg">
-                  <div className="msg-top">
-                    <b>{m.nick || "?"}</b>
-                    <span className="muted" style={{ fontSize: 12 }}>
-                      {m.at ? new Date(m.at).toLocaleTimeString("pt-BR") : ""}
-                    </span>
-                  </div>
-                  <div className="msg-text">{m.text}</div>
-                </div>
-              ))}
-            </div>
-
-            <form className="chat-send" onSubmit={sendText}>
-              <input
-                className="home-input"
-                value={text}
-                onChange={(e)=>setText(e.target.value)}
-                placeholder="Digite uma mensagem..."
-              />
-              <button className="btn primary" type="submit" disabled={!canSend || !connected}>
-                Enviar
-              </button>
-            </form>
-
-            <div className="muted" style={{ marginTop: 8 }}>
-              {isGeneral
-                ? "No Geral não existe admin."
-                : "Admin existe somente dentro do grupo (criador e promovidos)."}
+            <div className="chat-meta">
+              <span className={"badge " + (frozen ? "warn" : "good")}>
+                {frozen ? "CONGELADA" : "ATIVA"}
+              </span>
+              <span className="badge mono">Sala: <b>{roomId}</b></span>
             </div>
           </div>
-        </div>
 
-        <div className="chat-right">
-          <div className="chat-card">
-            <div className="chat-title">
-              Usuários ({usersList.length})
+          <div className="chat-list">
+            {msgs.map(m => (
+              <div key={m.id} className={"msg " + (m.nick === nick ? "me" : "")}>
+                <div className="msg-top">
+                  <div className="msg-nick">{m.nick}</div>
+                  <div className="msg-time">{fmtTime(m.ts)}</div>
+                </div>
+
+                {m.type === "text" && (
+                  <div className="msg-bubble">{m.content}</div>
+                )}
+
+                {m.type === "image" && (
+                  <div className="msg-bubble media">
+                    <img src={m.content} alt="imagem" className="msg-img" />
+                  </div>
+                )}
+
+                {m.type === "audio" && (
+                  <div className="msg-bubble media">
+                    <audio controls src={m.content} className="msg-audio" />
+                  </div>
+                )}
+              </div>
+            ))}
+            <div ref={listEndRef} />
+          </div>
+
+          <form className="chat-compose" onSubmit={sendText}>
+            <input
+              className="home-input"
+              value={text}
+              onChange={(e)=>setText(e.target.value)}
+              placeholder={frozen ? "Sala congelada…" : "Digite sua mensagem…"}
+              disabled={frozen}
+            />
+
+            <div className="compose-actions">
+              <input ref={fileInputRef} type="file" accept="image/*" style={{ display:"none" }} onChange={onPickImage} />
+              <input ref={audioInputRef} type="file" accept="audio/*" style={{ display:"none" }} onChange={onPickAudio} />
+
+              <button className="btn" type="button" onClick={pickImage} disabled={frozen || sending}>
+                Foto
+              </button>
+              <button className={"btn " + (recOn ? "warn" : "")} type="button" onClick={pickAudio} disabled={frozen || sending}>
+                {recOn ? "Parar" : "Áudio"}
+              </button>
+              <button className="btn primary" type="submit" disabled={frozen || sending || !text.trim()}>
+                Enviar
+              </button>
+            </div>
+          </form>
+
+          <div className="muted" style={{ marginTop: 8 }}>
+            Limites: texto até ~1200 caracteres • imagem/áudio até ~2MB (RAM).
+          </div>
+        </section>
+
+        <aside className="side-card">
+          <div className="side-title">Online agora</div>
+          <div className="side-sub muted">Usuários conectados nesta sala</div>
+
+          <div className="users-mini">
+            {users.map(u => (
+              <div key={u.socketId} className="user-mini">
+                <div className="user-mini-dot" />
+                <div className="user-mini-name">
+                  {u.nick}
+                  {admins.includes(u.socketId) && <span className="pill mono" style={{ marginLeft: 8 }}>admin</span>}
+                </div>
+              </div>
+            ))}
+            {users.length === 0 && <div className="muted">Ninguém por aqui…</div>}
+          </div>
+        </aside>
+      </main>
+
+      {/* ADMIN LIST MODAL */}
+      <Modal open={openAdmin} title="Admin do grupo" onClose={()=>setOpenAdmin(false)}>
+        {!isGroupAdmin && (
+          <div className="muted">
+            Você não é admin deste grupo.
+          </div>
+        )}
+
+        {isGroupAdmin && (
+          <div className="admin-list">
+            <div className="muted" style={{ marginBottom: 10 }}>
+              Clique em um usuário para abrir ações: <b>Avisar</b>, <b>Kick</b>, <b>Ban</b>, <b>Promover</b>.
             </div>
 
             <div className="users-list">
-              {usersList.map(u => (
+              {users.map(u => (
                 <button
                   key={u.socketId}
+                  className="user-pick"
                   type="button"
-                  className={"user-row " + ((!isGeneral && myRole==="admin") ? "clickable" : "")}
-                  onClick={()=>openUserActions(u)}
-                  title={!isGeneral && myRole==="admin" ? "Clique para ações" : ""}
+                  onClick={()=>selectUser(u)}
                 >
-                  <div>
+                  <div className="user-pick-left">
                     <div className="user-nick">{u.nick}</div>
-                    {!isGeneral && (
-                      <div className="muted" style={{ fontSize: 12 }}>
-                        {u.role === "admin" ? "admin" : "membro"}
-                      </div>
-                    )}
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      {admins.includes(u.socketId) ? "Admin do grupo" : "Membro"}
+                    </div>
                   </div>
-
-                  {!isGeneral && u.role === "admin" && (
-                    <span className="pill">admin</span>
-                  )}
+                  <div className="user-pick-right">
+                    {admins.includes(u.socketId) ? <span className="badge good">Admin</span> : <span className="badge">Usuário</span>}
+                  </div>
                 </button>
               ))}
-
-              {usersList.length === 0 && (
-                <div className="muted">Nenhum usuário.</div>
-              )}
+              {users.length === 0 && <div className="muted">Nenhum usuário no grupo.</div>}
             </div>
-
-            {!isGeneral && myRole !== "admin" && (
-              <div className="muted" style={{ marginTop: 10 }}>
-                Apenas admins podem abrir ações ao clicar no usuário.
-              </div>
-            )}
           </div>
-        </div>
-      </main>
+        )}
+      </Modal>
 
-      {/* ✅ Modal ações do usuário */}
-      <Modal open={userModal} title="Ações do grupo" onClose={()=>setUserModal(false)}>
-        {!selectedUser ? (
-          <div className="muted">Nenhum usuário selecionado.</div>
-        ) : (
-          <div className="form">
-            <div className="muted">
-              Usuário: <b style={{ color:"var(--text)" }}>{selectedUser.nick}</b>{" "}
-              {!isGeneral && selectedUser.role === "admin" && <span className="pill">admin</span>}
-            </div>
+      {/* USER ACTION MODAL */}
+      <Modal
+        open={openUserModal}
+        title={target ? `Ações • ${target.nick}` : "Ações"}
+        onClose={()=>setOpenUserModal(false)}
+      >
+        {!target && <div className="muted">Selecione um usuário.</div>}
 
-            <div className="row" style={{ marginTop: 10, flexWrap:"wrap" }}>
-              <button className="btn primary" type="button" onClick={promoteAdmin}>
-                Promover admin
+        {target && (
+          <form className="form" onSubmit={runUserAction}>
+            <div className="admin-actions-tabs">
+              <button type="button" className={"tab " + (action==="warn" ? "active":"")} onClick={()=>{ setAction("warn"); setActionMsg("Por favor, mantenha o respeito e siga as regras."); }}>
+                Avisar
               </button>
-
-              <button
-                className="btn"
-                type="button"
-                onClick={demoteAdmin}
-                disabled={selectedUser.role !== "admin"}
-                title={selectedUser.role !== "admin" ? "Usuário não é admin" : ""}
-              >
-                Demover admin
-              </button>
-
-              <button className="btn danger" type="button" onClick={kickUser}>
+              <button type="button" className={"tab " + (action==="kick" ? "active":"")} onClick={()=>{ setAction("kick"); setActionMsg("Você foi removido pelo administrador."); }}>
                 Kick
               </button>
-            </div>
-
-            <hr className="sep" style={{ margin: "12px 0" }} />
-
-            <label>
-              Aviso privado (só para ele)
-              <textarea
-                value={warnMsg}
-                onChange={(e)=>setWarnMsg(e.target.value)}
-                maxLength={220}
-              />
-            </label>
-            <div className="row">
-              <button className="btn" type="button" onClick={warnUser}>
-                Enviar aviso
+              <button type="button" className={"tab " + (action==="ban" ? "active":"")} onClick={()=>{ setAction("ban"); setActionMsg("Acesso bloqueado pelo administrador."); }}>
+                Ban
+              </button>
+              <button type="button" className={"tab " + (action==="promote" ? "active":"")} onClick={()=>{ setAction("promote"); setActionMsg(""); }}>
+                Promover admin
+              </button>
+              <button type="button" className={"tab " + (action==="demote" ? "active":"")} onClick={()=>{ setAction("demote"); setActionMsg(""); }}>
+                Remover admin
               </button>
             </div>
 
-            <hr className="sep" style={{ margin: "12px 0" }} />
+            {(action === "warn" || action === "kick" || action === "ban") && (
+              <label>
+                Mensagem
+                <textarea
+                  value={actionMsg}
+                  onChange={(e)=>setActionMsg(e.target.value)}
+                  placeholder="Digite a mensagem"
+                  maxLength={220}
+                  required={action === "warn" || action === "ban" || action === "kick"}
+                />
+              </label>
+            )}
 
-            <label>
-              Duração do ban (minutos) — 0 = permanente
-              <input
-                type="number"
-                min="0"
-                max="43200"
-                value={banMinutes}
-                onChange={(e)=>setBanMinutes(clamp(Number(e.target.value||0), 0, 43200))}
-              />
-            </label>
+            {action === "ban" && (
+              <label>
+                Duração (minutos) — 0 = permanente
+                <input
+                  type="number"
+                  min="0"
+                  max="43200"
+                  value={banMinutes}
+                  onChange={(e)=>setBanMinutes(Number(e.target.value || 0))}
+                />
+              </label>
+            )}
 
-            <label>
-              Motivo do ban
-              <textarea
-                value={banReason}
-                onChange={(e)=>setBanReason(e.target.value)}
-                maxLength={220}
-              />
-            </label>
-
-            <div className="row" style={{ justifyContent:"space-between" }}>
-              <button className="btn danger" type="button" onClick={banIp}>
-                Banir IP
-              </button>
-              <button className="btn" type="button" onClick={()=>setUserModal(false)}>
-                Fechar
+            <div className="row" style={{ justifyContent:"flex-end" }}>
+              <button type="button" className="btn" onClick={()=>setOpenUserModal(false)}>Cancelar</button>
+              <button className={"btn " + (action==="warn" || action==="promote" ? "primary" : "danger")} type="submit">
+                Confirmar
               </button>
             </div>
-          </div>
+
+            <div className="muted" style={{ marginTop: 8 }}>
+              * Admin só existe em grupos. No Geral não há admin.
+            </div>
+          </form>
         )}
       </Modal>
     </div>
