@@ -62,11 +62,6 @@ export default function Home(){
           </div>
         </div>
 
-        <div className="home-right">
-          <button className="btn" onClick={()=>nav("/area-reservada")}>Área Reservada</button>
-        </div>
-      </div>
-
       <div className="home-container">
         <div className="home-card">
           <h1>Entrar no chat</h1>
