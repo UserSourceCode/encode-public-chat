@@ -17,6 +17,8 @@ export default function Home(){
 
   async function createGroup(e){
     e.preventDefault();
+    if(!canNick) return;
+
     try{
       const r = await fetch("/api/groups", {
         method: "POST",
@@ -27,10 +29,15 @@ export default function Home(){
           nick
         })
       });
-      const j = await r.json();
-      if(!j.ok) return alert(j.error || "Erro ao criar grupo");
 
-      // entra no grupo via rota; o Room vai pedir/usar query (nick/pass)
+      const j = await r.json().catch(()=>null);
+      if(!j?.ok) return alert(j?.error || "Erro ao criar grupo");
+
+      // ✅ salva a chave do criador para este grupo
+      if(j.adminKey && j.groupId){
+        sessionStorage.setItem(`group_admin_key:${j.groupId}`, String(j.adminKey));
+      }
+
       nav(`/g/${j.groupId}?nick=${encodeURIComponent(nick.trim())}&pass=${encodeURIComponent(groupPass)}`);
     }catch{
       alert("Falha ao criar grupo.");
@@ -61,7 +68,7 @@ export default function Home(){
             <div className="home-sub">Chat Público + Grupos Privados (sem salvar nada)</div>
           </div>
         </div>
-         </div> 
+      </div>
 
       <div className="home-container">
         <div className="home-card">
@@ -71,25 +78,13 @@ export default function Home(){
           </p>
 
           <div className="home-tabs">
-            <button
-              className={"home-tab " + (tab==="geral" ? "active" : "")}
-              onClick={()=>setTab("geral")}
-              type="button"
-            >
+            <button className={"home-tab " + (tab==="geral" ? "active" : "")} onClick={()=>setTab("geral")} type="button">
               Geral
             </button>
-            <button
-              className={"home-tab " + (tab==="criar" ? "active" : "")}
-              onClick={()=>setTab("criar")}
-              type="button"
-            >
+            <button className={"home-tab " + (tab==="criar" ? "active" : "")} onClick={()=>setTab("criar")} type="button">
               Criar grupo
             </button>
-            <button
-              className={"home-tab " + (tab==="entrar" ? "active" : "")}
-              onClick={()=>setTab("entrar")}
-              type="button"
-            >
+            <button className={"home-tab " + (tab==="entrar" ? "active" : "")} onClick={()=>setTab("entrar")} type="button">
               Entrar em grupo
             </button>
           </div>
@@ -111,7 +106,7 @@ export default function Home(){
             {tab === "geral" && (
               <form onSubmit={enterPublic} className="home-form">
                 <div className="home-tip">
-                  Você entra com <span className="pill mono">apelido</span> e começa a conversar no <b>Geral</b>.
+                  Você entra com <span className="pill mono">apelido</span> e conversa no <b>Geral</b>.
                 </div>
                 <button className="btn primary" disabled={!canNick} type="submit">
                   Entrar no Geral
@@ -147,7 +142,9 @@ export default function Home(){
                 </label>
 
                 <div className="home-tip">
-                  Um ID será gerado para o grupo. Ele existe enquanto houver gente conectada.
+                  Um ID será gerado para o grupo. O grupo existe enquanto houver gente conectada.
+                  <br/>
+                  <b>Quem cria vira admin</b> (somente dentro do grupo).
                 </div>
 
                 <button className="btn primary" disabled={!canNick || groupPass.length < 3} type="submit">
